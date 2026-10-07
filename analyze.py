@@ -2,9 +2,15 @@
 
 Usage: python analyze.py [--since YYYY-MM-DD] [--config-version N] [--strategy NAME]
                          [--data-dir data] [--out data/reports/] [--equity 100000] [--no-baseline]
+       python analyze.py --config-version N --evidence "QUERY" [--registered YYYY-MM-DD]
+
+An evidence QUERY selects trades by conditions joined with "and", for example
+  "entry_minute_after_open >= 60"   "symbol in [TSLA, AMD] and side == short"   "weekday == 0"
+Columns: symbol, side, entry_minute_after_open, range_pct, weekday (0 = Monday).
 """
 import argparse
 import math
+import re
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -16,6 +22,13 @@ from logger import read_trades_frame
 
 MIN_SAMPLE = 30
 DEFAULT_EQUITY = 100_000.0
+EVIDENCE_MIN_TRADES = 20
+EVIDENCE_MIN_DAYS = 10
+POST_REGISTRATION_MIN_TRADES = 10
+T_95 = {1: 12.71, 2: 4.30, 3: 3.18, 4: 2.78, 5: 2.57, 6: 2.45, 7: 2.36, 8: 2.31, 9: 2.26, 10: 2.23,
+        12: 2.18, 15: 2.13, 20: 2.09, 30: 2.04, 60: 2.00, 120: 1.98}
+QUERY_COLUMNS = {"symbol": str, "side": str, "entry_minute_after_open": float, "range_pct": float, "weekday": float}
+CONDITION = re.compile(r"^\s*(\w+)\s*(==|!=|>=|<=|>|<|in)\s*(.+?)\s*$")
 
 
 def filter_trades(df, since=None, config_version=None, strategy=None):
@@ -70,6 +83,119 @@ def equity_stats(df, start_equity):
     }
 
 
+def t_95(dof):
+    """Two-sided 95% Student t critical value, rounded toward the more conservative table entry."""
+    return T_95[max(k for k in T_95 if k <= dof)] if dof < 120 else 1.96
+
+
+def expectancy_ci(df):
+    """Mean R per trade with a 95% range that treats each trading day as one cluster.
+
+    Trades on the same day share market conditions, so the effective sample size is closer to
+    the number of days than the number of trades.
+    """
+    r = pd.to_numeric(df["pnl_r"], errors="coerce")
+    keep = r.notna()
+    r, days_col = r[keep], df["date"][keep]
+    n, days = len(r), days_col.nunique()
+    if n == 0:
+        return {"n": 0, "days": 0, "mean": float("nan"), "lo": float("nan"), "hi": float("nan")}
+    mean = float(r.mean())
+    if days < 2:
+        return {"n": n, "days": days, "mean": mean, "lo": float("nan"), "hi": float("nan")}
+    resid = (r - mean).groupby(days_col).sum()
+    half = t_95(days - 1) * math.sqrt(days / (days - 1) * float((resid ** 2).sum()) / n ** 2)
+    return {"n": n, "days": days, "mean": mean, "lo": mean - half, "hi": mean + half}
+
+
+def fmt_range(ci):
+    if math.isnan(ci["lo"]):
+        return "n/a (needs 2+ days)"
+    return f"[{ci['lo']:+.2f}R, {ci['hi']:+.2f}R]"
+
+
+def range_note(ci):
+    if math.isnan(ci["lo"]):
+        return ""
+    if excludes_zero(ci):
+        return " (trades grouped by day; clearly away from zero)"
+    return " (trades grouped by day; includes zero, so the sign is not established)"
+
+
+def excludes_zero(ci):
+    return not math.isnan(ci["lo"]) and (ci["lo"] > 0 or ci["hi"] < 0)
+
+
+def parse_query(text):
+    """Parse 'col op value [and col op value ...]' into (column, op, value) tuples."""
+    conditions = []
+    for part in re.split(r"\s+and\s+", text.strip()):
+        m = CONDITION.match(part)
+        if not m or m.group(1) not in QUERY_COLUMNS:
+            raise ValueError(f"bad condition {part!r}; columns: {sorted(QUERY_COLUMNS)}")
+        col, op, raw = m.groups()
+        cast = QUERY_COLUMNS[col]
+        if op == "in":
+            if not (raw.startswith("[") and raw.endswith("]")):
+                raise ValueError(f"'in' needs a [list]: {part!r}")
+            value = [cast(v.strip().strip("'\"")) for v in raw[1:-1].split(",") if v.strip()]
+        else:
+            value = cast(raw.strip("'\""))
+        conditions.append((col, op, value))
+    return conditions
+
+
+def apply_query(df, conditions):
+    df = df.assign(weekday=pd.to_datetime(df["date"]).dt.weekday)
+    mask = pd.Series(True, index=df.index)
+    for col, op, value in conditions:
+        series = pd.to_numeric(df[col], errors="coerce") if QUERY_COLUMNS[col] is float else df[col].astype(str)
+        if op == "in":
+            mask &= series.isin(value)
+        else:
+            mask &= {"==": series.eq, "!=": series.ne, ">=": series.ge, "<=": series.le,
+                     ">": series.gt, "<": series.lt}[op](value)
+    return df[mask]
+
+
+def evidence(df, query, registered=None):
+    """Does the subset of trades matching `query` have an expectancy clearly away from zero?
+
+    Passes when the 95% range over 20+ trades and 10+ days excludes zero and, if `registered`
+    is given, the trades after that date (when the hypothesis was written down) point the same way.
+    """
+    subset = apply_query(df, parse_query(query))
+    ci = expectancy_ci(subset)
+    reasons = []
+    if ci["n"] < EVIDENCE_MIN_TRADES or ci["days"] < EVIDENCE_MIN_DAYS:
+        reasons.append(f"{ci['n']} trades over {ci['days']} days; needs {EVIDENCE_MIN_TRADES}+ over "
+                       f"{EVIDENCE_MIN_DAYS}+")
+    if math.isnan(ci["lo"]):
+        reasons.append("no 95% range yet (needs 2+ days)")
+    elif not excludes_zero(ci):
+        reasons.append(f"95% range {fmt_range(ci)} includes zero")
+    post = None
+    if registered is not None:
+        post = expectancy_ci(subset[subset["date"] > registered])
+        if post["n"] < POST_REGISTRATION_MIN_TRADES:
+            reasons.append(f"{post['n']} trades since {registered}; needs {POST_REGISTRATION_MIN_TRADES}+")
+        elif math.isnan(ci["mean"]) or (post["mean"] > 0) != (ci["mean"] > 0):
+            reasons.append(f"trades since {registered} average {post['mean']:+.2f}R, the other direction")
+    return {"query": query, "all": ci, "since_registered": post, "registered": registered,
+            "passed": not reasons, "reasons": reasons}
+
+
+def format_evidence(result):
+    ci, post = result["all"], result["since_registered"]
+    lines = [f"Evidence for: {result['query']}",
+             f"- All matching trades: {ci['n']} over {ci['days']} days, expectancy {_fmt(ci['mean'], 'r')}, "
+             f"95% range {fmt_range(ci)}"]
+    if post is not None:
+        lines.append(f"- Since {result['registered']}: {post['n']} trades, expectancy {_fmt(post['mean'], 'r')}")
+    lines.append("- Verdict: PASS" if result["passed"] else "- Verdict: FAIL (" + "; ".join(result["reasons"]) + ")")
+    return "\n".join(lines)
+
+
 def time_bucket(minute_after_open, width=15):
     if minute_after_open is None or (isinstance(minute_after_open, float) and math.isnan(minute_after_open)):
         return "unknown"
@@ -79,18 +205,21 @@ def time_bucket(minute_after_open, width=15):
 
 
 def breakdown(df, key):
-    """Per-group trade count, win rate, total $ and expectancy in R."""
+    """Per-group trade count, days, win rate, total $, expectancy in R and its 95% range."""
+    columns = ["n", "days", "win_rate", "pnl_usd", "expectancy_r", "range_95", "total_r"]
     if df.empty:
-        return pd.DataFrame(columns=["n", "win_rate", "pnl_usd", "expectancy_r", "total_r"])
+        return pd.DataFrame(columns=columns)
     groups = df.assign(_r=pd.to_numeric(df["pnl_r"], errors="coerce"),
                        _pnl=df["pnl_usd"].astype(float)).groupby(key, sort=True)
     return pd.DataFrame({
         "n": groups.size(),
+        "days": groups["date"].nunique(),
         "win_rate": groups["_pnl"].apply(lambda s: (s > 0).mean()),
         "pnl_usd": groups["_pnl"].sum(),
         "expectancy_r": groups["_r"].mean(),
+        "range_95": groups.apply(lambda g: fmt_range(expectancy_ci(g)), include_groups=False),
         "total_r": groups["_r"].sum(),
-    })
+    })[columns]
 
 
 def add_keys(df):
@@ -157,6 +286,7 @@ def build_report(df, start_equity, baseline=None, title="Performance report", fi
     df = add_keys(df)
     s = summary_stats(df)
     e = equity_stats(df, start_equity)
+    ci = expectancy_ci(df)
     first, last = df["date"].min(), df["date"].max()
     lines += [
         f"Period: {first} to {last} ({s['trading_days']} trading days with trades)", "",
@@ -166,6 +296,7 @@ def build_report(df, start_equity, baseline=None, title="Performance report", fi
         f"- Average win: {_fmt(s['avg_win_usd'], 'usd')} ({_fmt(s['avg_win_r'], 'r')})",
         f"- Average loss: {_fmt(s['avg_loss_usd'], 'usd')} ({_fmt(s['avg_loss_r'], 'r')})",
         f"- Expectancy: {_fmt(s['expectancy_r'], 'r')} / {_fmt(s['expectancy_usd'], 'usd')} per trade",
+        f"- Expectancy 95% range: {fmt_range(ci)}{range_note(ci)}",
         f"- Profit factor: {_fmt(s['profit_factor'])}",
         f"- Net P&L: {_fmt(s['total_pnl'], 'usd')}",
         "", "## Equity curve", "",
@@ -221,10 +352,20 @@ def main(argv=None):
     ap.add_argument("--out", default="data/reports/")
     ap.add_argument("--equity", type=float, default=None, help="starting equity if daily_summary.csv lacks it")
     ap.add_argument("--no-baseline", action="store_true")
+    ap.add_argument("--evidence", metavar="QUERY", help="test one hypothesis instead of writing a report")
+    ap.add_argument("--registered", type=date.fromisoformat,
+                    help="with --evidence: date the hypothesis was written down")
     args = ap.parse_args(argv)
 
     df = filter_trades(read_trades_frame(Path(args.data_dir) / "trades.csv"),
                        args.since, args.config_version, args.strategy)
+    if args.evidence:
+        try:
+            print(format_evidence(evidence(df, args.evidence, args.registered)))
+        except ValueError as e:
+            print(f"error: {e}")
+            return 2
+        return 0
     filters = ", ".join(f"{k}={v}" for k, v in [("since", args.since), ("config_version", args.config_version),
                                                  ("strategy", args.strategy), ("data_dir", args.data_dir)] if v)
     baseline = "skipped (--no-baseline)"

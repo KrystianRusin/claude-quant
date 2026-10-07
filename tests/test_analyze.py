@@ -125,3 +125,68 @@ def test_cli_writes_report(tmp_path, capsys):
     assert main(["--data-dir", str(tmp_path), "--out", str(out), "--no-baseline", "--equity", "10000"]) == 0
     assert "Total return: +0.50%" in capsys.readouterr().out
     assert len(list(out.glob("report_*.md"))) == 1
+
+
+def r_trades(by_day, symbol="SPY", minute=20):
+    """Synthetic trades: {day_offset: [R, ...]}, each with 1R = $100."""
+    rows = []
+    for d, rs in by_day.items():
+        for r in rs:
+            rows.append({"date": date(2026, 9, 1) + timedelta(days=d), "symbol": symbol, "side": "long",
+                         "pnl_r": r, "pnl_usd": r * 100, "entry_minute_after_open": minute, "range_pct": 0.5})
+    import pandas as pd
+    return pd.DataFrame(rows)
+
+
+def test_expectancy_ci_clusters_by_day():
+    from analyze import expectancy_ci
+    ci = expectancy_ci(r_trades({0: [1, -1], 1: [2, 0], 2: [-1, -1]}))
+    assert (ci["n"], ci["days"], ci["mean"]) == (6, 3, 0)
+    assert ci["hi"] == pytest.approx(4.30 * (1 / 3) ** 0.5, rel=1e-3)
+    assert ci["lo"] == pytest.approx(-ci["hi"])
+
+
+def test_expectancy_ci_one_day_has_no_range():
+    import math
+    from analyze import expectancy_ci
+    assert math.isnan(expectancy_ci(r_trades({0: [1, -1, 2]}))["lo"])
+
+
+def test_parse_and_apply_query():
+    import pandas as pd
+    from analyze import apply_query, parse_query
+    df = pd.concat([r_trades({0: [1]}, "TSLA", 70), r_trades({1: [1]}, "AMD", 10), r_trades({2: [1]}, "SPY", 70)])
+    assert list(apply_query(df, parse_query("entry_minute_after_open >= 60"))["symbol"]) == ["TSLA", "SPY"]
+    assert list(apply_query(df, parse_query("symbol in [TSLA, AMD] and entry_minute_after_open < 60"))["symbol"]) == ["AMD"]
+    assert len(apply_query(df, parse_query("weekday == 1"))) == 1  # 2026-09-01 is a Tuesday
+    for bad in ("pnl_r > 0", "symbol ~ TSLA", "exit_reason == tp"):
+        with pytest.raises(ValueError):
+            parse_query(bad)
+
+
+def test_evidence_verdicts():
+    from analyze import evidence
+    losing = r_trades({d: [-1, -0.8] for d in range(12)})
+    result = evidence(losing, "symbol == SPY")
+    assert result["passed"] and result["all"]["hi"] < 0
+
+    assert not evidence(r_trades({d: [-1, -0.8] for d in range(8)}), "symbol == SPY")["passed"]
+    noisy = r_trades({d: [2, 1, 0] if d % 2 else [-1, -1, -1] for d in range(12)})
+    assert any("includes zero" in r for r in evidence(noisy, "symbol == SPY")["reasons"])
+
+    registered = date(2026, 9, 1) + timedelta(days=9)
+    few_after = evidence(losing, "symbol == SPY", registered)
+    assert not few_after["passed"] and any("since" in r for r in few_after["reasons"])
+    flipped = pd_concat(losing, r_trades({d: [3, 3] for d in range(12, 18)}))
+    result = evidence(flipped, "symbol == SPY", registered)
+    assert not result["passed"]
+
+
+def pd_concat(*frames):
+    import pandas as pd
+    return pd.concat(frames, ignore_index=True)
+
+
+def test_report_shows_range(trades):
+    assert "Expectancy 95% range: [" in build_report(trades, 10_000)
+    assert "range_95" in build_report(trades, 10_000)

@@ -154,8 +154,14 @@ Also set the power plan so the machine does not sleep during market hours.
 and a limited tool allowlist. The reviewer reads the report and logs, always writes a dated
 changelog entry, and changes things only when the evidence is strong enough:
 
-- One parameter or one watchlist change per review, only with 30+ trades over 10+ trading days
-  under the current config version. Risk increases only after a net-profitable stretch.
+- One parameter change per review, only with 30+ trades over 10+ trading days under the current
+  config version. Risk increases only after a net-profitable stretch.
+- The change must rest on a hypothesis written into memory on an earlier day as a trade filter
+  (for example `entry_minute_after_open >= 60`). The guard re-runs
+  `python analyze.py --evidence "<filter>" --registered <date>`: 20+ matching trades over 10+ days,
+  a 95% range that excludes zero, and 10+ trades since it was written down pointing the same way.
+  Ranges group trades by day, since same-day trades are partly the same bet. Writing hypotheses
+  down first stops the reviewer from searching until something looks significant by chance.
 - It may write a new strategy module under `strategies/` (with tests and a 10-day in-sample replay)
   at most once per 10 trading days.
 

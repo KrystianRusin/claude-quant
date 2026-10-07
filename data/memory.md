@@ -15,6 +15,10 @@ Format and rules:
 - Never delete an entry. Retire it: move it under `## Retired` with the date and the reason.
 - At most 40 active entries. When full, merge overlapping entries or retire weak ones before adding.
 - Update `Last reviewed` and the evidence when new days bear on an entry, for or against.
+- A hypothesis about a subset of trades gets a `- Query:` line, for example
+  `` - Query: `entry_minute_after_open >= 60` `` (see `python analyze.py --help` for the syntax).
+  Only a hypothesis written down on an earlier day can justify a config change, and its query must
+  pass `python analyze.py --config-version N --evidence "<query>" --registered <Since date>`.
 
 ## Active
 

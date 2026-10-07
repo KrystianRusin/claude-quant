@@ -223,3 +223,52 @@ def test_watchlist_entries_not_rewritten():
     new = wl(["SPY", "QQQ"])
     new["symbols"][0]["reason"] = "changed my mind"
     assert any("must not be rewritten" in e for e in wl_errors(old, new))
+
+
+def late_losers(days=16):
+    rows = []
+    for d in range(days):
+        for minute, r in ((70, -1.0), (75, -0.8), (20, 0.5)):
+            rows.append({"date": date(2026, 9, 1) + timedelta(days=d), "symbol": "SPY", "side": "long",
+                         "pnl_r": r, "pnl_usd": r * 100, "entry_minute_after_open": minute, "range_pct": 0.5})
+    return pd.DataFrame(rows)
+
+
+HYPOTHESIS = """## Active
+
+### M-3: late entries lose
+- Status: supported
+- Since: 2026-09-08 | Last reviewed: 2026-09-20
+- Query: `entry_minute_after_open >= 60`
+- Evidence: x
+"""
+CHANGE = [("strategy.entry_window_end", "11:00", "10:30")]
+EV_TODAY = date(2026, 9, 20)
+
+
+def test_evidence_required_for_param_change():
+    errors = guard.evidence_errors(CHANGE, "## 2026-09-20\nmoved window", HYPOTHESIS, late_losers(), EV_TODAY)
+    assert any("Evidence: M-<id>" in e for e in errors)
+
+
+def test_evidence_passes_with_registered_hypothesis():
+    assert guard.evidence_errors(CHANGE, "Evidence: M-3", HYPOTHESIS, late_losers(), EV_TODAY) == []
+
+
+def test_evidence_must_be_registered_earlier():
+    errors = guard.evidence_errors(CHANGE, "Evidence: M-4", HYPOTHESIS, late_losers(), EV_TODAY)
+    assert any("not in memory before" in e for e in errors)
+    today_entry = HYPOTHESIS.replace("Since: 2026-09-08", "Since: 2026-09-20")
+    errors = guard.evidence_errors(CHANGE, "Evidence: M-3", today_entry, late_losers(), EV_TODAY)
+    assert any("registered today" in e for e in errors)
+
+
+def test_evidence_fails_on_thin_data():
+    errors = guard.evidence_errors(CHANGE, "Evidence: M-3", HYPOTHESIS, late_losers(days=9), EV_TODAY)
+    assert any("did not pass" in e for e in errors)
+
+
+def test_risk_decrease_needs_no_evidence():
+    change = [("risk.risk_per_trade_pct", 0.5, 0.25)]
+    assert guard.evidence_errors(change, "", "", late_losers(), EV_TODAY) == []
+    assert guard.evidence_errors([("risk.risk_per_trade_pct", 0.5, 0.75)], "", "", late_losers(), EV_TODAY)

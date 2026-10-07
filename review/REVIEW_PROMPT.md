@@ -48,9 +48,15 @@ Entry template:
 - Status: hypothesis
 - Since: <date> | Last reviewed: <date>
 - Scope: <strategy name and version, config version, or "all">
+- Query: `<optional: the trades this is about, e.g. entry_minute_after_open >= 60>`
 - Evidence: <dates, trade count, numbers; for and against>
 - Implication: <what to watch or test; never a direct instruction to change config>
 ```
+
+Write a hypothesis down as soon as you suspect a pattern, with a `Query` line, even when the
+evidence is thin. Only hypotheses written on an earlier day can later justify a config change,
+and they are judged on the trades that came after you wrote them. This stops you from searching
+the data until something looks significant by chance.
 
 - Update existing entries when today adds evidence for or against them, and move them up or down
   the status ladder only when the evidence thresholds are met.
@@ -78,9 +84,16 @@ Change `config.json` only if all of these hold:
 
 - At least 30 closed trades and at least 10 distinct trading days under the current `version`.
   Trades on the same day share market conditions, so the day count matters as much as the trade count.
-- A specific, evidenced pattern, for example: entries after 10:30 have negative expectancy over
-  20+ trades, or one ticker has lost more than 3R over 10+ trades.
+- The pattern behind it is a memory hypothesis with a `Query`, written on an earlier day, and it
+  passes `python analyze.py --config-version N --evidence "<query>" --registered <its Since date>`:
+  20+ matching trades over 10+ days, a 95% range that excludes zero, and 10+ trades since it was
+  written down pointing the same way. Cite it in the changelog entry as `Evidence: M-<id>`.
 - The change is one parameter. (Watchlist swaps follow their own rules in section 7.)
+- Risk reductions (`risk.*` lowered) need no evidence query, but still need the reason recorded.
+
+Every result in the report comes with a 95% range. If the range includes zero, the sign of the
+effect is not known yet; say so instead of drawing a conclusion. Trading is grouped by day for
+these ranges, so ten trades on one day count for much less than ten trades on ten days.
 
 When you change it:
 

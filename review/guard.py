@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from config import BOUNDS_PATH, ConfigError, load_config, load_json  # noqa: E402
+from analyze import evidence, format_evidence  # noqa: E402
 from logger import read_trades_frame  # noqa: E402
 
 MIN_TRADES = 30
@@ -165,6 +166,52 @@ def config_change_errors(old, new, trades):
     return errors
 
 
+def memory_entries(text):
+    """{id: {"query": str | None, "since": date | None}} for every entry in a memory file."""
+    blocks = MEMORY_ENTRY.split(text.replace("\r\n", "\n"))[1:]
+    out = {}
+    for entry_id, body in zip(blocks[::2], blocks[1::2]):
+        query = re.search(r"^- Query: *`([^`]+)`", body, re.MULTILINE)
+        since = re.search(r"^- Since: *(\d{4}-\d{2}-\d{2})", body, re.MULTILINE)
+        out[entry_id] = {"query": query.group(1) if query else None,
+                         "since": date.fromisoformat(since.group(1)) if since else None}
+    return out
+
+
+def evidence_errors(changes, changelog_added, base_memory, trades, today):
+    """A parameter change must cite a pre-registered memory hypothesis whose query passes the evidence test.
+
+    Risk-reducing changes are exempt.
+    """
+    if not changes or all(p.startswith("risk.") and isinstance(a, (int, float)) and isinstance(b, (int, float))
+                          and b < a for p, a, b in changes):
+        return []
+    refs = sorted(set(re.findall(r"Evidence: *(M-\d+)", changelog_added)))
+    if not refs:
+        return ["config change needs 'Evidence: M-<id>' in today's changelog entry, citing a memory "
+                "hypothesis with a Query"]
+    entries = memory_entries(base_memory)
+    reports = []
+    for ref in refs:
+        entry = entries.get(ref)
+        if entry is None:
+            reports.append(f"{ref}: not in memory before this review (write hypotheses down first)")
+        elif not entry["query"] or not entry["since"]:
+            reports.append(f"{ref}: needs '- Query: `...`' and '- Since: <date>' lines")
+        elif entry["since"] >= today:
+            reports.append(f"{ref}: registered today; evidence must come from a hypothesis written earlier")
+        else:
+            try:
+                result = evidence(trades, entry["query"], entry["since"])
+            except ValueError as e:
+                reports.append(f"{ref}: {e}")
+                continue
+            if result["passed"]:
+                return []
+            reports.append(f"{ref}: {format_evidence(result)}")
+    return ["config change evidence did not pass:\n" + "\n".join(reports)]
+
+
 def watchlist_change_errors(old, new, universe, today, rules):
     """Paced, explained swaps from the current universe; history is append-only."""
     errors = []
@@ -236,6 +283,17 @@ def check(base, snapshot=None, skip_replay=False):
     old.pop("watchlist", None)
     trades = read_trades_frame(ROOT / "data/trades.csv")
     errors += config_change_errors(old, new, trades)
+    switched = old["strategy"]["name"] != new["strategy"]["name"] or old["strategy_version"] != new["strategy_version"]
+    if not switched:
+        changes = [c for c in leaf_changes(old, new) if c[0] not in ("version", "strategy_version")]
+        old_log = subprocess.run(["git", "show", f"{base}:data/changelog.md"], cwd=ROOT,
+                                 capture_output=True, text=True).stdout.replace("\r\n", "\n")
+        new_log = (ROOT / "data/changelog.md").read_text(encoding="utf-8").replace("\r\n", "\n")
+        added_log = new_log[len(old_log):] if new_log.startswith(old_log) else new_log
+        base_memory = subprocess.run(["git", "show", f"{base}:data/memory.md"], cwd=ROOT,
+                                     capture_output=True, text=True).stdout
+        errors += evidence_errors(changes, added_log, base_memory,
+                                  trades[trades["config_version"] == old["version"]], date.today())
     if exists_at(base, "watchlist.json"):
         universe_path = ROOT / "data/universe.json"
         universe = json.loads(universe_path.read_text(encoding="utf-8")) if universe_path.exists() else None
@@ -246,7 +304,7 @@ def check(base, snapshot=None, skip_replay=False):
     if code != 0:
         errors.append(f"pytest failed:\n{out}")
     strategy_touched = any(p.startswith("strategies/") for p in paths)
-    switched = old["strategy"] != new["strategy"] or old["strategy_version"] != new["strategy_version"]
+    switched = switched or old["strategy"] != new["strategy"]
     if (strategy_touched or switched) and not skip_replay:
         code, out = run([sys.executable, "trader.py", "--replay-last", str(REPLAY_DAYS),
                          "--data-dir", "data/replay_check"])
