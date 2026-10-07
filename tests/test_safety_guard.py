@@ -38,6 +38,13 @@ def bumped(cfg, **changes):
     ("strategies/orb_v2.py", True),
     ("tests/test_orb_v2.py", True),
     ("config.shadow.json", True),
+    ("data/memory.md", True),
+    ("watchlist.json", True),
+    ("data/universe.json", False),
+    ("review/universe.py", False),
+    ("data/journal/2026-10-07.md", True),
+    ("data/journal/notes.md", False),
+    ("review/day_report.py", False),
     ("strategies/__init__.py", False),
     ("strategies/base.py", False),
     ("tests/test_safety_strategies.py", False),
@@ -85,10 +92,6 @@ def test_version_must_increment_by_one(cfg):
 def test_only_one_change(cfg):
     new = bumped(cfg, **{"strategy.take_profit_r": 1.5, "strategy.stop_loss_r": 0.8})
     assert any("exactly one" in e for e in guard.config_change_errors(cfg, new, make_trades(30, 10)))
-    new = bumped(cfg, watchlist=cfg["watchlist"] + ["IWM", "DIA"])
-    assert any("exactly one" in e for e in guard.config_change_errors(cfg, new, make_trades(30, 10)))
-    new = bumped(cfg, watchlist=cfg["watchlist"][1:])
-    assert guard.config_change_errors(cfg, new, make_trades(30, 10)) == []
 
 
 def test_risk_increase_needs_profit(cfg):
@@ -111,3 +114,112 @@ def test_strategy_switch_pacing(cfg):
 def test_module_version():
     assert guard.module_version("NAME = 'x'\nVERSION = 3\n") == 3
     assert guard.module_version("x = 1") is None
+
+
+def memory(*entries, retired=()):
+    def block(entry_id, status):
+        return f"### {entry_id}: title\n- Status: {status}\n- Evidence: x\n"
+    return ("# Trading memory\n\n## Active\n\n" + "".join(block(*e) for e in entries)
+            + "\n## Retired\n\n" + "".join(block(*e) for e in retired))
+
+
+def test_memory_valid_growth_and_retire():
+    old = memory(("M-1", "hypothesis"))
+    assert guard.memory_errors(old, memory(("M-1", "supported"), ("M-2", "hypothesis"))) == []
+    assert guard.memory_errors(old, memory(retired=[("M-1", "retired")])) == []
+
+
+def test_memory_entries_never_deleted():
+    old = memory(("M-1", "hypothesis"), ("M-2", "hypothesis"))
+    assert any("deleted" in e for e in guard.memory_errors(old, memory(("M-2", "hypothesis"))))
+
+
+def test_memory_status_required():
+    errors = guard.memory_errors("", memory(("M-1", "probably")))
+    assert any("M-1" in e and "Status" in e for e in errors)
+
+
+def test_memory_active_cap():
+    many = memory(*[(f"M-{i}", "hypothesis") for i in range(guard.MAX_ACTIVE_MEMORIES + 1)])
+    assert any("active entries" in e for e in guard.memory_errors("", many))
+    retired = memory(retired=[(f"M-{i}", "retired") for i in range(guard.MAX_ACTIVE_MEMORIES + 1)])
+    assert guard.memory_errors("", retired) == []
+
+
+def test_shipped_memory_file_is_valid():
+    text = (Path(__file__).resolve().parents[1] / "data" / "memory.md").read_text(encoding="utf-8")
+    assert guard.memory_errors(text, text) == []
+
+
+TODAY = date(2026, 10, 20)
+RULES = {"max_adds_per_review": 3, "max_removes_per_review": 3, "readd_cooldown_days": 10,
+         "max_universe_age_days": 4}
+
+
+def wl(symbols, removed=()):
+    return {"symbols": [{"symbol": s, "added": "2026-10-06", "reason": "initial"} for s in symbols],
+            "removed": [dict(r) for r in removed]}
+
+
+def add(w, sym, added=TODAY.isoformat()):
+    w["symbols"].append({"symbol": sym, "added": added, "reason": "high range, liquid"})
+    return w
+
+
+def remove(w, sym, when=TODAY.isoformat()):
+    w["symbols"] = [e for e in w["symbols"] if e["symbol"] != sym]
+    w["removed"].append({"symbol": sym, "removed": when, "reason": "low range"})
+    return w
+
+
+UNIVERSE = {"generated": "2026-10-19", "symbols": {s: {} for s in ["SPY", "QQQ", "AMD", "MU", "XOM", "JPM", "BA"]}}
+
+
+def wl_errors(old, new, universe=UNIVERSE):
+    return guard.watchlist_change_errors(old, new, universe, TODAY, RULES)
+
+
+def test_watchlist_swap_ok():
+    old = wl(["SPY", "QQQ", "AMD"])
+    new = remove(add(wl(["SPY", "QQQ", "AMD"]), "MU"), "AMD")
+    assert wl_errors(old, new) == []
+
+
+def test_watchlist_limits():
+    old = wl(["SPY"])
+    new = wl(["SPY"])
+    for sym in ("MU", "XOM", "JPM", "BA"):
+        add(new, sym)
+    assert any("4 adds" in e for e in wl_errors(old, new))
+
+
+def test_watchlist_add_must_be_in_fresh_universe():
+    old = wl(["SPY"])
+    assert any("not in the current universe" in e for e in wl_errors(old, add(wl(["SPY"]), "GME")))
+    stale = {**UNIVERSE, "generated": "2026-10-10"}
+    assert any("days old" in e for e in wl_errors(old, add(wl(["SPY"]), "MU"), stale))
+    assert any("no data/universe.json" in e for e in wl_errors(old, add(wl(["SPY"]), "MU"), None))
+    assert any("must be today" in e for e in wl_errors(old, add(wl(["SPY"]), "MU", added="2026-10-01")))
+
+
+def test_watchlist_remove_needs_log_and_history_is_append_only():
+    old = wl(["SPY", "QQQ"], removed=[{"symbol": "AMD", "removed": "2026-09-01", "reason": "x"}])
+    silent = wl(["SPY"], removed=old["removed"])
+    assert any("needs a 'removed' entry" in e for e in wl_errors(old, silent))
+    rewritten = remove(wl(["SPY", "QQQ"]), "QQQ")
+    assert any("append-only" in e for e in wl_errors(old, rewritten))
+
+
+def test_watchlist_readd_cooldown():
+    old = wl(["SPY"], removed=[{"symbol": "MU", "removed": "2026-10-15", "reason": "x"}])
+    new = add(wl(["SPY"], removed=old["removed"]), "MU")
+    assert any("wait 10 days" in e for e in wl_errors(old, new))
+    old["removed"][0]["removed"] = new["removed"][0]["removed"] = "2026-10-01"
+    assert wl_errors(old, new) == []
+
+
+def test_watchlist_entries_not_rewritten():
+    old = wl(["SPY", "QQQ"])
+    new = wl(["SPY", "QQQ"])
+    new["symbols"][0]["reason"] = "changed my mind"
+    assert any("must not be rewritten" in e for e in wl_errors(old, new))

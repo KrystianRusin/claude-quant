@@ -55,3 +55,4 @@ def test_level_error():
     assert "wrong side" in level_error("short", 100, 101, 102)
     assert "outside" in level_error("long", 100, 99.99, 102)
     assert "outside" in level_error("long", 100, 90, 120)
+    assert "below" in level_error("long", 4, 3.9, 4.2)

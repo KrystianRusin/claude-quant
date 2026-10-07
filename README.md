@@ -74,7 +74,8 @@ one commit and a configured `user.name` / `user.email`.
 | `python trader.py --replay-last 10` | Simulates the last 10 completed trading days. |
 | `python trader.py --flatten` | Cancels all open orders and closes all positions now. |
 | `python analyze.py` | Prints a markdown report and saves it to `data/reports/`. Options: `--since`, `--config-version`, `--strategy`, `--data-dir`, `--no-baseline`. |
-| `python config.py` | Validates `config.json` against `config_bounds.json`. |
+| `python config.py` | Validates `config.json` and `watchlist.json` against `config_bounds.json`. |
+| `python review/universe.py` | Rebuilds `data/universe.json`, the screened list the watchlist is picked from (about 4 minutes). |
 
 Use the venv's Python (`.venv/Scripts/python`) or activate the venv first.
 
@@ -109,6 +110,7 @@ including ones you opened by hand.
 | `data/daily_summary.csv` | One row per trading day. |
 | `data/trader.log` | Session log with error tracebacks. |
 | `data/changelog.md` | Every review entry and config or strategy change, with reasoning. |
+| `data/universe.json` | Tonight's screened universe with liquidity and movement stats. |
 | `data/reports/` | Analytics reports and nightly review logs. |
 
 The CSVs are git-ignored. Back them up if you move machines.
@@ -162,6 +164,26 @@ files outside the allowlist, edits to the trade data, an invalid config, more th
 too little evidence, risk increases after losses, strategy edits without a version bump, failing
 tests, or a failing replay. The run log goes to `data/reports/review_<date>.log`.
 
+### Watchlist and universe
+
+Claude picks the watchlist. Before each review, `review/universe.py` screens every US stock and ETF
+on free full-market daily bars: price at least $10, at least $300M average daily dollar volume,
+leveraged and inverse ETFs excluded, top 300 kept, with each symbol's average range and gap.
+The reviewer can swap symbols in `watchlist.json` from that list: at most 3 adds and 3 removes per
+review, 5 to 25 symbols, each with the date and reason, removals logged, and a 10-day wait before
+a removed symbol returns. Swaps do not bump the config version, so parameter evidence keeps
+accumulating. The screening criteria and swap limits live in `config_bounds.json`.
+
+### Journal and memory
+
+Each review starts by reading `data/memory.md`, then runs `python review/day_report.py` (the day's
+trades, skipped signals, halts, log warnings and the SPY move) and writes `data/journal/<date>.md`:
+what went well, what went wrong, luck versus logic, and execution problems. Lessons worth keeping
+across days go into `data/memory.md`, each with a status (`hypothesis`, `supported`, `confirmed`,
+`retired`) and its evidence. The guard enforces that past journal entries are never edited, memory
+entries are retired rather than deleted, and there are at most 40 active entries. Memory informs the
+review but never overrides the evidence thresholds for config changes.
+
 `REVIEW_MODE=propose review/run_review.sh` makes the reviewer write proposals into the changelog
 instead of editing anything, if you prefer to approve changes yourself.
 
@@ -192,7 +214,7 @@ Strategies and `risk.py` do not change.
 
 ## Open decisions
 
-- Watchlist: the fixed list in `config.json`, or a pre-market gap scanner later.
+- Watchlist: picked by the reviewer from the nightly universe. A pre-market gap scanner could come later.
 - Whether this machine will reliably be on at 09:20 ET every trading day.
 - Whether the nightly review auto-commits changes (default) or only proposes them (`REVIEW_MODE=propose`).
 

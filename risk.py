@@ -2,6 +2,7 @@
 import math
 
 MAX_ORDERS_PER_DAY = 60
+MIN_PRICE = 5.0
 MIN_STOP_PCT = 0.05
 MAX_STOP_PCT = 5.0
 
@@ -44,8 +45,8 @@ def short_allowed(shortable, easy_to_borrow):
 
 def level_error(side, price, stop, take_profit):
     """Why a signal's stop/target are unacceptable, or None if they are fine."""
-    if price <= 0:
-        return "bad price"
+    if price < MIN_PRICE:
+        return f"price below ${MIN_PRICE:.0f}"
     direction = 1 if side == "long" else -1
     if (price - stop) * direction <= 0:
         return "stop on wrong side of price"

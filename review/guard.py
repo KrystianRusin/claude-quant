@@ -9,6 +9,8 @@ python review/guard.py revert --base REV --snapshot DIR
 import argparse
 import ast
 import json
+import re
+from datetime import date
 import shutil
 import subprocess
 import sys
@@ -17,15 +19,20 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from config import ConfigError, load_config  # noqa: E402
+from config import BOUNDS_PATH, ConfigError, load_config, load_json  # noqa: E402
 from logger import read_trades_frame  # noqa: E402
 
 MIN_TRADES = 30
 MIN_DAYS = 10
 STRATEGY_MIN_DAYS = 10
 REPLAY_DAYS = 10
-DATA_FILES = ["data/trades.csv", "data/orders.csv", "data/daily_summary.csv"]
-EDITABLE_FILES = {"config.json", "config.shadow.json", "data/changelog.md"}
+DATA_FILES = ["data/trades.csv", "data/orders.csv", "data/daily_summary.csv", "data/universe.json"]
+EDITABLE_FILES = {"config.json", "config.shadow.json", "watchlist.json", "data/changelog.md", "data/memory.md"}
+JOURNAL = re.compile(r"^data/journal/\d{4}-\d{2}-\d{2}\.md$")
+MEMORY_ENTRY = re.compile(r"^### (M-\d+):", re.MULTILINE)
+MEMORY_STATUSES = {"hypothesis", "supported", "confirmed", "retired"}
+MAX_ACTIVE_MEMORIES = 40
+MAX_MEMORY_BYTES = 60_000
 PROTECTED_STRATEGY_FILES = {"strategies/__init__.py", "strategies/base.py"}
 
 
@@ -41,7 +48,7 @@ def changed_paths(base):
 
 
 def path_allowed(path):
-    if path in EDITABLE_FILES or path.startswith("data/reports/"):
+    if path in EDITABLE_FILES or path.startswith("data/reports/") or JOURNAL.match(path):
         return True
     if path.startswith("strategies/") and path.endswith(".py"):
         return path not in PROTECTED_STRATEGY_FILES and path.count("/") == 1
@@ -52,6 +59,37 @@ def path_allowed(path):
 
 def path_errors(paths):
     return [f"{p}: the reviewer may not change this file" for p in paths if not path_allowed(p)]
+
+
+def exists_at(base, path):
+    return subprocess.run(["git", "cat-file", "-e", f"{base}:{path}"], cwd=ROOT,
+                          capture_output=True).returncode == 0
+
+
+def journal_errors(base, paths):
+    """Past journal entries are a record: they may be added, never edited."""
+    return [f"{p}: past journal entries must not be edited"
+            for p in paths if JOURNAL.match(p) and exists_at(base, p)]
+
+
+def memory_errors(old_text, new_text):
+    """Entries are never deleted, the active list stays small, and every entry has a valid status."""
+    errors = []
+    if len(new_text.encode("utf-8")) > MAX_MEMORY_BYTES:
+        errors.append(f"data/memory.md is over {MAX_MEMORY_BYTES} bytes; merge or retire entries")
+    missing = sorted(set(MEMORY_ENTRY.findall(old_text)) - set(MEMORY_ENTRY.findall(new_text)))
+    if missing:
+        errors.append(f"data/memory.md: entries deleted instead of retired: {missing}")
+    active = new_text.split("## Retired")[0]
+    n_active = len(MEMORY_ENTRY.findall(active))
+    if n_active > MAX_ACTIVE_MEMORIES:
+        errors.append(f"data/memory.md: {n_active} active entries, max {MAX_ACTIVE_MEMORIES}")
+    blocks = MEMORY_ENTRY.split(new_text)[1:]
+    for entry_id, body in zip(blocks[::2], blocks[1::2]):
+        status = re.search(r"^- Status: *(\w+)", body, re.MULTILINE)
+        if not status or status.group(1) not in MEMORY_STATUSES:
+            errors.append(f"data/memory.md {entry_id}: needs '- Status:' with one of {sorted(MEMORY_STATUSES)}")
+    return errors
 
 
 def module_version(source):
@@ -79,15 +117,12 @@ def strategy_version_errors(base, paths):
 
 
 def leaf_changes(old, new, prefix=""):
-    """List of (path, old, new) for changed leaves; watchlist adds/removes count one each."""
+    """List of (path, old, new) for changed leaves."""
     out = []
     for key in sorted(set(old) | set(new)):
         path = f"{prefix}{key}"
         a, b = old.get(key), new.get(key)
-        if path == "watchlist" and isinstance(a, list) and isinstance(b, list):
-            out += [(f"watchlist+{s}", None, s) for s in b if s not in a]
-            out += [(f"watchlist-{s}", s, None) for s in a if s not in b]
-        elif isinstance(a, dict) and isinstance(b, dict):
+        if isinstance(a, dict) and isinstance(b, dict):
             out += leaf_changes(a, b, f"{path}.")
         elif a != b:
             out.append((path, a, b))
@@ -116,7 +151,7 @@ def config_change_errors(old, new, trades):
             errors.append("strategy_version must increase")
         return errors
     if len(changes) != 1:
-        errors.append(f"exactly one parameter or one watchlist add/remove per review; got {[c[0] for c in changes]}")
+        errors.append(f"exactly one parameter change per review; got {[c[0] for c in changes]}")
     n, days = len(under_version), under_version["date"].nunique()
     if n < MIN_TRADES or days < MIN_DAYS:
         errors.append(f"config v{old['version']} has {n} trades over {days} days; "
@@ -130,6 +165,45 @@ def config_change_errors(old, new, trades):
     return errors
 
 
+def watchlist_change_errors(old, new, universe, today, rules):
+    """Paced, explained swaps from the current universe; history is append-only."""
+    errors = []
+    old_entries = {e["symbol"]: e for e in old["symbols"]}
+    new_entries = {e["symbol"]: e for e in new["symbols"]}
+    adds = sorted(set(new_entries) - set(old_entries))
+    removes = sorted(set(old_entries) - set(new_entries))
+    if len(adds) > rules["max_adds_per_review"]:
+        errors.append(f"watchlist: {len(adds)} adds, max {rules['max_adds_per_review']} per review")
+    if len(removes) > rules["max_removes_per_review"]:
+        errors.append(f"watchlist: {len(removes)} removes, max {rules['max_removes_per_review']} per review")
+    for sym in set(old_entries) & set(new_entries):
+        if old_entries[sym] != new_entries[sym]:
+            errors.append(f"watchlist {sym}: existing entries must not be rewritten")
+    if new["removed"][:len(old["removed"])] != old["removed"]:
+        errors.append("watchlist.removed: history is append-only")
+    logged = {e["symbol"] for e in new["removed"][len(old["removed"]):]}
+    for sym in removes:
+        if sym not in logged:
+            errors.append(f"watchlist: removing {sym} needs a 'removed' entry with date and reason")
+    if adds:
+        age = (today - date.fromisoformat(universe["generated"])).days if universe else None
+        if universe is None:
+            errors.append("watchlist: no data/universe.json to add symbols from")
+        elif age > rules["max_universe_age_days"]:
+            errors.append(f"watchlist: universe is {age} days old; adds need one under "
+                          f"{rules['max_universe_age_days']} days")
+    for sym in adds:
+        if universe and sym not in universe["symbols"]:
+            errors.append(f"watchlist: {sym} is not in the current universe")
+        if new_entries[sym].get("added") != today.isoformat():
+            errors.append(f"watchlist {sym}: 'added' must be today ({today})")
+        for r in old["removed"]:
+            if r["symbol"] == sym and (today - date.fromisoformat(r["removed"])).days < rules["readd_cooldown_days"]:
+                errors.append(f"watchlist: {sym} was removed on {r['removed']}; "
+                              f"wait {rules['readd_cooldown_days']} days before re-adding")
+    return errors
+
+
 def run(cmd):
     proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
     return proc.returncode, (proc.stdout + proc.stderr)[-3000:]
@@ -137,7 +211,12 @@ def run(cmd):
 
 def check(base, snapshot=None, skip_replay=False):
     paths = changed_paths(base)
-    errors = path_errors(paths) + strategy_version_errors(base, paths)
+    errors = path_errors(paths) + strategy_version_errors(base, paths) + journal_errors(base, paths)
+    memory_path = ROOT / "data/memory.md"
+    if memory_path.exists():
+        old_memory = subprocess.run(["git", "show", f"{base}:data/memory.md"], cwd=ROOT,
+                                    capture_output=True, text=True).stdout
+        errors += memory_errors(old_memory, memory_path.read_text(encoding="utf-8"))
     if snapshot:
         for f in DATA_FILES:
             saved, live = Path(snapshot) / Path(f).name, ROOT / f
@@ -152,9 +231,17 @@ def check(base, snapshot=None, skip_replay=False):
             load_config(ROOT / "config.shadow.json")
         except ConfigError as e:
             errors.append(f"config.shadow.json: {e}")
+    new.pop("watchlist", None)
     old = json.loads(git("show", f"{base}:config.json"))
+    old.pop("watchlist", None)
     trades = read_trades_frame(ROOT / "data/trades.csv")
     errors += config_change_errors(old, new, trades)
+    if exists_at(base, "watchlist.json"):
+        universe_path = ROOT / "data/universe.json"
+        universe = json.loads(universe_path.read_text(encoding="utf-8")) if universe_path.exists() else None
+        errors += watchlist_change_errors(json.loads(git("show", f"{base}:watchlist.json")),
+                                          load_json(ROOT / "watchlist.json"), universe, date.today(),
+                                          load_json(BOUNDS_PATH)["watchlist_rules"])
     code, out = run([sys.executable, "-m", "pytest", "-q"])
     if code != 0:
         errors.append(f"pytest failed:\n{out}")
@@ -178,15 +265,16 @@ def snapshot(dest):
 
 
 def revert(base, snap):
+    """Undo every change since `base`, except a newly added journal entry, which is kept as a record."""
     before = set((Path(snap) / "untracked.txt").read_text(encoding="utf-8").split())
     for p in git("diff", "--name-only", base).split():
-        if subprocess.run(["git", "cat-file", "-e", f"{base}:{p}"], cwd=ROOT).returncode == 0:
+        if exists_at(base, p):
             git("checkout", base, "--", p)
-        else:
+        elif not JOURNAL.match(p):
             git("rm", "-q", "-f", "--", p, check=False)
             (ROOT / p).unlink(missing_ok=True)
     for p in git("ls-files", "--others", "--exclude-standard").split():
-        if p not in before:
+        if p not in before and not JOURNAL.match(p):
             (ROOT / p).unlink(missing_ok=True)
     for f in DATA_FILES:
         saved = Path(snap) / Path(f).name

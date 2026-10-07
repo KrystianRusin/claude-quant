@@ -1,18 +1,6 @@
 {
   "version": 1,
   "strategy_version": 1,
-  "watchlist": [
-    "SPY",
-    "QQQ",
-    "AAPL",
-    "MSFT",
-    "NVDA",
-    "TSLA",
-    "AMD",
-    "META",
-    "AMZN",
-    "GOOGL"
-  ],
   "strategy": {
     "name": "opening_range_breakout",
     "opening_range_minutes": 15,

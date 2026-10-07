@@ -33,7 +33,13 @@ def test_bounds_ceilings(bounds):
     assert r["max_trades_per_day"]["max"] <= 12
     assert 1.0 <= bounds["strategy_params"]["take_profit_r"]["min"]
     assert bounds["strategy_params"]["take_profit_r"]["max"] <= 4.0
-    assert bounds["watchlist"]["max_items"] <= 25
+    assert bounds["watchlist_rules"]["max_symbols"] <= 25
+    assert bounds["watchlist_rules"]["max_adds_per_review"] <= 3
+    assert bounds["watchlist_rules"]["max_removes_per_review"] <= 3
+    assert bounds["universe"]["min_price"] >= risk.MIN_PRICE >= 5
+    assert bounds["universe"]["min_avg_dollar_volume"] >= 100_000_000
+    assert "TQQQ" in bounds["universe"]["exclude_symbols"]
+    assert "leveraged" in bounds["universe"]["exclude_name_patterns"]
     assert bounds["data_feed"]["allowed"] == ["iex"]
     assert bounds["strategy"]["force_exit_time"]["max"] <= "15:50"
 

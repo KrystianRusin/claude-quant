@@ -9,6 +9,7 @@ data/trader.log
 data/dry_run/
 data/replay/
 data/*.csv
+data/universe.json
 data/replay_check/
 data/shadow/
 data/reports/*.log

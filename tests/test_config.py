@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from config import ConfigError, load_config, validate
+from config import ConfigError, load_config, validate, validate_watchlist
 
 
 def test_shipped_config_is_valid(cfg, bounds):
@@ -41,18 +41,37 @@ def test_bad_time_format(cfg, bounds):
     assert any("HH:MM" in e for e in validate(cfg, bounds))
 
 
-def test_watchlist_rules(cfg, bounds):
-    cfg["watchlist"] = cfg["watchlist"] + ["GME"]
-    assert any("not allowed" in e for e in validate(cfg, bounds))
+def test_shipped_watchlist_is_valid(watchlist, bounds):
+    assert validate_watchlist(watchlist, bounds["watchlist_rules"]) == []
 
-    cfg["watchlist"] = ["SPY", "SPY"]
-    assert any("duplicate" in e for e in validate(cfg, bounds))
 
-    cfg["watchlist"] = bounds["watchlist"]["allowed"][:26]
-    assert any("at most 25" in e for e in validate(cfg, bounds))
+def test_watchlist_rules(watchlist, bounds):
+    rules = bounds["watchlist_rules"]
+    watchlist["symbols"].append(dict(watchlist["symbols"][0]))
+    assert any("duplicate" in e for e in validate_watchlist(watchlist, rules))
 
-    cfg["watchlist"] = []
-    assert validate(cfg, bounds)
+    watchlist["symbols"] = [{"symbol": f"A{chr(65 + i)}", "added": "2026-10-07", "reason": "x"} for i in range(26)]
+    assert any("must be 5-25" in e for e in validate_watchlist(watchlist, rules))
+
+    watchlist["symbols"] = watchlist["symbols"][:5]
+    watchlist["symbols"][0]["symbol"] = "brk.b"
+    watchlist["symbols"][1]["reason"] = " "
+    errors = validate_watchlist(watchlist, rules)
+    assert any("bad symbol" in e for e in errors) and any("reason" in e for e in errors)
+
+    watchlist["removed"] = [{"symbol": "XYZ", "removed": "yesterday"}]
+    assert any("removed[0]" in e for e in validate_watchlist(watchlist, rules))
+
+
+def test_load_config_injects_watchlist():
+    assert load_config()["watchlist"][:2] == ["SPY", "QQQ"]
+
+
+def test_watchlist_not_allowed_in_config_json(tmp_path, cfg):
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(cfg))
+    with pytest.raises(ConfigError, match="lives in watchlist.json"):
+        load_config(config_path=path)
 
 
 def test_unknown_and_missing_keys(cfg, bounds):
@@ -97,6 +116,7 @@ def test_cross_field_rules(cfg, bounds):
 
 def test_load_config_raises(tmp_path, cfg):
     cfg["risk"]["risk_per_trade_pct"] = 5
+    del cfg["watchlist"]
     path = tmp_path / "config.json"
     path.write_text(json.dumps(cfg))
     with pytest.raises(ConfigError, match="risk_per_trade_pct"):

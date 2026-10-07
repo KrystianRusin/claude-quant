@@ -1,0 +1,55 @@
+{
+  "symbols": [
+    {
+      "symbol": "SPY",
+      "added": "2026-10-06",
+      "reason": "initial list"
+    },
+    {
+      "symbol": "QQQ",
+      "added": "2026-10-06",
+      "reason": "initial list"
+    },
+    {
+      "symbol": "AAPL",
+      "added": "2026-10-06",
+      "reason": "initial list"
+    },
+    {
+      "symbol": "MSFT",
+      "added": "2026-10-06",
+      "reason": "initial list"
+    },
+    {
+      "symbol": "NVDA",
+      "added": "2026-10-06",
+      "reason": "initial list"
+    },
+    {
+      "symbol": "TSLA",
+      "added": "2026-10-06",
+      "reason": "initial list"
+    },
+    {
+      "symbol": "AMD",
+      "added": "2026-10-06",
+      "reason": "initial list"
+    },
+    {
+      "symbol": "META",
+      "added": "2026-10-06",
+      "reason": "initial list"
+    },
+    {
+      "symbol": "AMZN",
+      "added": "2026-10-06",
+      "reason": "initial list"
+    },
+    {
+      "symbol": "GOOGL",
+      "added": "2026-10-06",
+      "reason": "initial list"
+    }
+  ],
+  "removed": []
+}

@@ -26,6 +26,9 @@ if [ -n "$(git status --porcelain -- . ':!data')" ]; then
 fi
 
 base=$(git rev-parse HEAD)
+if ! python review/universe.py; then
+  echo "universe screen failed; watchlist adds will be refused if the old one is stale"
+fi
 snapshot=$(mktemp -d)
 python review/guard.py snapshot "$snapshot"
 
@@ -33,18 +36,19 @@ prompt="$(cat review/REVIEW_PROMPT.md)"
 if [ "${REVIEW_MODE:-commit}" = "propose" ]; then
   prompt="$prompt
 
-PROPOSAL MODE: do not edit config.json, config.shadow.json or anything under strategies/ or tests/,
+PROPOSAL MODE: do not edit config.json, watchlist.json, config.shadow.json or anything under strategies/ or tests/,
 and do not commit. Write any change you would make under a 'Proposed change' heading in today's
 changelog entry instead."
 fi
 
 claude -p "$prompt" \
   --allowedTools "Read" "Glob" "Grep" \
-    "Edit(config.json)" "Edit(config.shadow.json)" "Write(config.shadow.json)" "Edit(data/changelog.md)" \
+    "Edit(config.json)" "Edit(watchlist.json)" "Edit(config.shadow.json)" "Write(config.shadow.json)" "Edit(data/changelog.md)" \
+    "Edit(data/memory.md)" "Write(data/journal/**)" \
     "Edit(strategies/**)" "Write(strategies/**)" "Edit(tests/**)" "Write(tests/**)" \
     "Bash(python analyze.py:*)" "Bash(python config.py)" "Bash(python -m pytest:*)" \
     "Bash(python trader.py --replay:*)" "Bash(python trader.py --replay-last:*)" \
-    "Bash(python review/guard.py check:*)" "Bash(date:*)" \
+    "Bash(python review/guard.py check:*)" "Bash(python review/day_report.py:*)" "Bash(date:*)" \
     "Bash(git status:*)" "Bash(git diff:*)" "Bash(git log:*)" "Bash(git show:*)" \
     "Bash(git add:*)" "Bash(git commit:*)" "Bash(git checkout -- :*)"
 echo "=== claude exited with $?"
@@ -58,7 +62,8 @@ else
   message="review $today: reverted changes that failed the guard"
 fi
 
-paths=(config.json data/changelog.md strategies tests)
+paths=(config.json watchlist.json data/changelog.md data/memory.md strategies tests)
+[ -d data/journal ] && paths+=(data/journal)
 [ -e config.shadow.json ] || git ls-files --error-unmatch config.shadow.json >/dev/null 2>&1 && paths+=(config.shadow.json)
 git add -A -- "${paths[@]}"
 if ! git diff --cached --quiet; then

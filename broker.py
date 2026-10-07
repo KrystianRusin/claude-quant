@@ -240,6 +240,31 @@ class AlpacaBroker(Broker):
         asset = self.trading.get_asset(symbol)
         return asset.shortable, asset.easy_to_borrow
 
+    def list_equities(self):
+        """Active, tradable US equities and ETFs as dicts."""
+        from alpaca.trading.enums import AssetClass, AssetStatus
+        from alpaca.trading.requests import GetAssetsRequest
+
+        assets = self.trading.get_all_assets(GetAssetsRequest(status=AssetStatus.ACTIVE,
+                                                              asset_class=AssetClass.US_EQUITY))
+        return [{"symbol": a.symbol, "name": a.name or "", "exchange": _value(a.exchange),
+                 "shortable": bool(a.shortable), "easy_to_borrow": bool(a.easy_to_borrow)}
+                for a in assets if a.tradable]
+
+    def daily_bars_many(self, symbols, start, end, batch=1000):
+        """{symbol: daily bar frame} for many symbols, fetched in batches."""
+        from alpaca.data.enums import DataFeed
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+
+        out = {}
+        symbols = list(symbols)
+        for i in range(0, len(symbols), batch):
+            req = StockBarsRequest(symbol_or_symbols=symbols[i:i + batch], timeframe=TimeFrame.Day,
+                                   start=start, end=end, feed=DataFeed(self.feed))
+            out.update(bars_to_frames(self.data.get_stock_bars(req).df))
+        return out
+
     def _submit(self, req):
         from alpaca.common.exceptions import APIError
 

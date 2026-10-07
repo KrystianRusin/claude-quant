@@ -1,8 +1,9 @@
-"""Load config.json and validate it against config_bounds.json.
+"""Load config.json and watchlist.json and validate them against config_bounds.json.
 
-Run `python config.py` to validate the current config from the command line.
+Run `python config.py` to validate the current config and watchlist from the command line.
 """
 import json
+import re
 import sys
 from datetime import datetime, time
 from pathlib import Path
@@ -10,7 +11,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "config.json"
 BOUNDS_PATH = ROOT / "config_bounds.json"
+WATCHLIST_PATH = ROOT / "watchlist.json"
 MARKET_OPEN = time(9, 30)
+SYMBOL = re.compile(r"^[A-Z]{1,5}$")
+NOT_CONFIG = ("strategy", "strategy_params", "watchlist_rules", "universe")
 
 
 class ConfigError(ValueError):
@@ -62,18 +66,6 @@ def _check_leaf(path, value, rule):
     elif kind == "choice":
         if value not in rule["allowed"]:
             errors.append(f"{path}: {value!r} not in {rule['allowed']}")
-    elif kind == "symbols":
-        if not isinstance(value, list) or not all(isinstance(s, str) for s in value):
-            return [f"{path}: expected a list of symbols"]
-        if len(set(value)) != len(value):
-            errors.append(f"{path}: duplicate symbols")
-        bad = [s for s in value if s not in rule["allowed"]]
-        if bad:
-            errors.append(f"{path}: symbols not allowed by bounds: {bad}")
-        if len(value) < rule.get("min_items", 0):
-            errors.append(f"{path}: needs at least {rule['min_items']} symbols")
-        if "max_items" in rule and len(value) > rule["max_items"]:
-            errors.append(f"{path}: at most {rule['max_items']} symbols allowed, got {len(value)}")
     else:
         errors.append(f"{path}: unknown bounds type {kind!r}")
     return errors
@@ -128,19 +120,62 @@ def validate(config, bounds):
     """Return a list of human-readable errors; empty means valid."""
     if not isinstance(config, dict):
         return ["config: expected an object"]
-    top = {k: v for k, v in bounds.items() if k not in ("strategy", "strategy_params")}
-    errors = _walk({k: v for k, v in config.items() if k != "strategy"}, top)
+    top = {k: v for k, v in bounds.items() if k not in NOT_CONFIG}
+    errors = _walk({k: v for k, v in config.items() if k not in ("strategy", "watchlist")}, top)
     if "strategy" not in config:
         return errors + ["strategy: missing"]
     return errors + _strategy_errors(config, bounds)
 
 
-def load_config(config_path=CONFIG_PATH, bounds_path=BOUNDS_PATH):
-    """Load and validate the config. Raises ConfigError listing every problem."""
+def _is_date(v):
+    try:
+        datetime.strptime(v, "%Y-%m-%d")
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def validate_watchlist(data, rules):
+    """Return a list of errors for watchlist.json; empty means valid."""
+    if not isinstance(data, dict) or not isinstance(data.get("symbols"), list) \
+            or not isinstance(data.get("removed"), list):
+        return ['watchlist.json: expected {"symbols": [...], "removed": [...]}']
+    errors = []
+    symbols = []
+    for i, entry in enumerate(data["symbols"]):
+        sym = entry.get("symbol") if isinstance(entry, dict) else None
+        if not isinstance(sym, str) or not SYMBOL.match(sym):
+            errors.append(f"watchlist.symbols[{i}]: bad symbol {sym!r}")
+            continue
+        symbols.append(sym)
+        if not _is_date(entry.get("added")) or not str(entry.get("reason", "")).strip():
+            errors.append(f"watchlist {sym}: needs an 'added' date (YYYY-MM-DD) and a 'reason'")
+    if len(set(symbols)) != len(symbols):
+        errors.append("watchlist: duplicate symbols")
+    if not rules["min_symbols"] <= len(symbols) <= rules["max_symbols"]:
+        errors.append(f"watchlist: {len(symbols)} symbols, must be {rules['min_symbols']}-{rules['max_symbols']}")
+    for i, entry in enumerate(data["removed"]):
+        if not isinstance(entry, dict) or not isinstance(entry.get("symbol"), str) \
+                or not _is_date(entry.get("removed")) or not str(entry.get("reason", "")).strip():
+            errors.append(f"watchlist.removed[{i}]: needs 'symbol', 'removed' date and 'reason'")
+    return errors
+
+
+def load_config(config_path=CONFIG_PATH, bounds_path=BOUNDS_PATH, watchlist_path=WATCHLIST_PATH):
+    """Load and validate the config and watchlist; the watchlist's symbols land in config["watchlist"].
+
+    Raises ConfigError listing every problem.
+    """
     config = load_json(config_path)
-    errors = validate(config, load_json(bounds_path))
+    bounds = load_json(bounds_path)
+    errors = validate(config, bounds)
+    if "watchlist" in config:
+        errors.append("watchlist: lives in watchlist.json, not config.json")
+    watchlist = load_json(watchlist_path)
+    errors += validate_watchlist(watchlist, bounds["watchlist_rules"])
     if errors:
-        raise ConfigError("config.json is invalid:\n  " + "\n  ".join(errors))
+        raise ConfigError("config is invalid:\n  " + "\n  ".join(errors))
+    config["watchlist"] = [e["symbol"] for e in watchlist["symbols"]]
     return config
 
 
@@ -150,4 +185,5 @@ if __name__ == "__main__":
     except ConfigError as e:
         print(e)
         sys.exit(1)
-    print(f"config.json is valid (version {cfg['version']})")
+    print(f"config.json and watchlist.json are valid (version {cfg['version']}, "
+          f"{len(cfg['watchlist'])} symbols: {' '.join(cfg['watchlist'])})")
