@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "strategy_version": 1,
+  "watchlist": [
+    "SPY",
+    "QQQ",
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "TSLA",
+    "AMD",
+    "META",
+    "AMZN",
+    "GOOGL"
+  ],
+  "strategy": {
+    "name": "opening_range_breakout",
+    "opening_range_minutes": 15,
+    "entry_window_end": "11:00",
+    "force_exit_time": "15:45",
+    "stop_loss_r": 1.0,
+    "take_profit_r": 2.0,
+    "min_range_pct": 0.15,
+    "max_range_pct": 2.5,
+    "require_above_vwap_for_long": true,
+    "allow_shorts": true
+  },
+  "risk": {
+    "risk_per_trade_pct": 0.5,
+    "max_trades_per_day": 10,
+    "max_daily_loss_pct": 1.5,
+    "max_position_pct_of_equity": 20
+  },
+  "data_feed": "iex",
+  "timezone": "America/New_York"
+}

@@ -1,0 +1,36 @@
+{
+  "version": {"type": "int", "min": 1},
+  "strategy_version": {"type": "int", "min": 1},
+  "watchlist": {
+    "type": "symbols",
+    "min_items": 1,
+    "max_items": 25,
+    "allowed": [
+      "SPY", "QQQ", "IWM", "DIA", "SMH", "XLF", "XLE", "XLK", "XLV", "XLI", "GLD", "TLT",
+      "AAPL", "MSFT", "NVDA", "TSLA", "AMD", "META", "AMZN", "GOOGL", "GOOG", "AVGO",
+      "NFLX", "JPM", "BAC", "WFC", "GS", "XOM", "CVX", "UNH", "LLY", "JNJ", "V", "MA",
+      "COST", "WMT", "HD", "ORCL", "CRM", "ADBE", "INTC", "MU", "QCOM", "TXN", "CSCO",
+      "PEP", "KO", "DIS", "BA", "CAT"
+    ]
+  },
+  "strategy": {
+    "name": {"type": "strategy"},
+    "entry_window_end": {"type": "time", "min": "09:35", "max": "12:00"},
+    "force_exit_time": {"type": "time", "min": "15:00", "max": "15:50"}
+  },
+  "strategy_params": {
+    "opening_range_minutes": {"type": "int", "min": 5, "max": 60},
+    "stop_loss_r": {"type": "float", "min": 0.25, "max": 1.5},
+    "take_profit_r": {"type": "float", "min": 1.0, "max": 4.0},
+    "min_range_pct": {"type": "float", "min": 0.05, "max": 1.0},
+    "max_range_pct": {"type": "float", "min": 0.5, "max": 5.0}
+  },
+  "risk": {
+    "risk_per_trade_pct": {"type": "float", "min": 0.1, "max": 1.0},
+    "max_trades_per_day": {"type": "int", "min": 1, "max": 12},
+    "max_daily_loss_pct": {"type": "float", "min": 0.5, "max": 3.0},
+    "max_position_pct_of_equity": {"type": "float", "min": 5, "max": 25}
+  },
+  "data_feed": {"type": "choice", "allowed": ["iex"]},
+  "timezone": {"type": "choice", "allowed": ["America/New_York"]}
+}

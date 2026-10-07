@@ -1,0 +1,14 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+HALT
+data/*.lock
+data/trader.log
+data/dry_run/
+data/replay/
+data/*.csv
+data/replay_check/
+data/shadow/
+data/reports/*.log
