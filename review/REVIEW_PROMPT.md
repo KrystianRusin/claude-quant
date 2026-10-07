@@ -68,7 +68,8 @@ the data until something looks significant by chance.
 
 1. Run `python analyze.py` (writes `data/reports/report_<date>.md` and prints it). Also run it with
    `--config-version N` for the current `version` in `config.json`.
-2. Read `data/daily_summary.csv`, `data/changelog.md`, `config.json` and `config_bounds.json`.
+2. Read `data/lifetime.md` (all-time record since day one, regenerated before you start),
+   `data/daily_summary.csv`, `data/changelog.md`, `config.json` and `config_bounds.json`.
 3. Only `data/trades.csv` counts as evidence. Results under `data/replay*/` and `data/dry_run/` are
    simulations and must never be mixed into it.
 
@@ -171,10 +172,11 @@ results (`python analyze.py --data-dir data/shadow --no-baseline --out ""`) are 
 
 ## 9. Protected files
 
-Never edit: `trader.py`, `broker.py`, `simbroker.py`, `risk.py`, `analyze.py`, `logger.py`,
-`config.py`, `config_bounds.json`, `.env`, anything in `review/`, `strategies/__init__.py`,
+Never edit: `trader.py`, `broker.py`, `simbroker.py`, `risk.py`, `analyze.py`, `lifetime.py`,
+`logger.py`, `config.py`, `config_bounds.json`, `.env`, anything in `review/`, `strategies/__init__.py`,
 `strategies/base.py`, `tests/conftest.py`, `tests/helpers.py`, any `tests/test_safety*` file,
-and the data files `data/trades.csv`, `data/orders.csv`, `data/daily_summary.csv`, `data/universe.json`.
+and the data files `data/trades.csv`, `data/orders.csv`, `data/daily_summary.csv`,
+`data/universe.json`, `data/lifetime.md`.
 Do not change how results are measured and do not weaken any safety limit.
 
 ## 10. Commit

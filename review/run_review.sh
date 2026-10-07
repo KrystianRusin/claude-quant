@@ -25,6 +25,11 @@ if [ -n "$(git status --porcelain -- . ':!data')" ]; then
   exit 1
 fi
 
+if python lifetime.py > /dev/null; then
+  git add data/lifetime.md
+  git diff --cached --quiet -- data/lifetime.md || git commit -q -m "lifetime stats $today" -- data/lifetime.md
+fi
+
 base=$(git rev-parse HEAD)
 if ! python review/universe.py; then
   echo "universe screen failed; watchlist adds will be refused if the old one is stale"

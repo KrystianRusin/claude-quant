@@ -75,6 +75,7 @@ one commit and a configured `user.name` / `user.email`.
 | `python trader.py --flatten` | Cancels all open orders and closes all positions now. |
 | `python analyze.py` | Prints a markdown report and saves it to `data/reports/`. Options: `--since`, `--config-version`, `--strategy`, `--data-dir`, `--no-baseline`. |
 | `python config.py` | Validates `config.json` and `watchlist.json` against `config_bounds.json`. |
+| `python lifetime.py` | Rebuilds `data/lifetime.md`, the all-time statistics. |
 | `python review/universe.py` | Rebuilds `data/universe.json`, the screened list the watchlist is picked from (about 4 minutes). |
 
 Use the venv's Python (`.venv/Scripts/python`) or activate the venv first.
@@ -110,6 +111,7 @@ including ones you opened by hand.
 | `data/daily_summary.csv` | One row per trading day. |
 | `data/trader.log` | Session log with error tracebacks. |
 | `data/changelog.md` | Every review entry and config or strategy change, with reasoning. |
+| `data/lifetime.md` | All-time record since day one: totals, equity and drawdown, records, monthly and yearly tables, per strategy and config version. Regenerated and committed before each nightly review. |
 | `data/universe.json` | Tonight's screened universe with liquidity and movement stats. |
 | `data/reports/` | Analytics reports and nightly review logs. |
 
