@@ -10,6 +10,7 @@ deterministic and makes no LLM calls. See [SPEC.md](SPEC.md) for the full design
 > no slippage, queue position, partial fills or market impact, and the simulated fills used by
 > `--dry-run` and `--replay` are more optimistic still. Results over a short window, good or bad,
 > are not evidence of skill.
+> This is purely for me to test and see how good Claude can actually be at developing trading strategies and executing them
 
 ## Setup
 
