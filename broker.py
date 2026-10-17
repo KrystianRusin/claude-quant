@@ -111,7 +111,8 @@ class Broker(ABC):
         """All orders created after `after`, any status, with legs."""
 
     @abstractmethod
-    def cancel_order(self, order_id): ...
+    def cancel_order(self, order_id):
+        """Request a cancel. Returns quietly if the order is already closed or being canceled."""
 
     @abstractmethod
     def list_positions(self) -> dict:
@@ -319,7 +320,15 @@ class AlpacaBroker(Broker):
         return [order_from_alpaca(o) for o in orders]
 
     def cancel_order(self, order_id):
-        self.trading.cancel_order_by_id(order_id)
+        from alpaca.common.exceptions import APIError
+
+        try:
+            self.trading.cancel_order_by_id(order_id)
+        except APIError as e:
+            # 422: already pending cancel, canceled or filled. Cancelling one bracket leg
+            # cancels its OCO sibling, so this is the normal result for the second leg.
+            if e.status_code != 422:
+                raise
 
     def list_positions(self):
         return {p.symbol: Position(p.symbol, float(p.qty), float(p.avg_entry_price))
