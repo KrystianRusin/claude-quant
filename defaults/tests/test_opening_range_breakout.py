@@ -38,7 +38,7 @@ def test_long_breakout(s):
     assert sig.bar_time == OPEN + timedelta(minutes=16)
     assert sig.price == 101.0
     assert sig.stop == pytest.approx(99.5)
-    assert sig.take_profit == pytest.approx(101.0 + 2 * 1.5)
+    assert sig.take_profit == pytest.approx(101.0 + s["take_profit_r"] * 1.5)
 
 
 def test_short_breakout_and_allow_shorts(s):
@@ -46,7 +46,7 @@ def test_short_breakout_and_allow_shorts(s):
     sig = find_signal("SPY", bars, OPEN, s, WINDOW_END)
     assert sig.side == "short"
     assert sig.stop == pytest.approx(100.5)
-    assert sig.take_profit == pytest.approx(99.2 - 2 * 1.3)
+    assert sig.take_profit == pytest.approx(99.2 - s["take_profit_r"] * 1.3)
 
     s["allow_shorts"] = False
     assert find_signal("SPY", bars, OPEN, s, WINDOW_END) is None

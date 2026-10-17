@@ -1,12 +1,16 @@
-"""Strategy modules may only compute signals: no broker access, no I/O, no network."""
+"""Strategy modules may only compute signals: no broker access, no I/O, no network.
+
+Runs against the seed strategies in CI, and against the agent's strategies (QUANT_STATE_DIR=data)
+when the review guard checks a review.
+"""
 import ast
-from pathlib import Path
+import sys
 
 import pytest
 
 import strategies
 
-STRATEGY_DIR = Path(strategies.__file__).parent
+STRATEGY_DIR = strategies.STRATEGY_DIR
 ALLOWED_IMPORTS = {"__future__", "abc", "collections", "dataclasses", "datetime", "enum", "functools",
                    "itertools", "math", "numpy", "pandas", "statistics", "strategies", "typing"}
 FORBIDDEN_CALLS = {"open", "eval", "exec", "compile", "__import__", "input", "breakpoint",
@@ -36,13 +40,11 @@ def violations(path):
 
 
 def test_strategy_files_found():
-    assert STRATEGY_DIR / "opening_range_breakout.py" in STRATEGY_FILES
+    assert STRATEGY_FILES, f"no strategies in {STRATEGY_DIR}"
 
 
 @pytest.mark.parametrize("path", STRATEGY_FILES, ids=lambda p: p.name)
 def test_strategy_module_is_pure(path):
-    if path.name == "__init__.py":
-        pytest.skip("registry loader, not a strategy")
     assert violations(path) == []
 
 
@@ -69,3 +71,17 @@ def test_every_strategy_implements_interface(name):
     assert isinstance(module.VERSION, int) and module.VERSION >= 1
     assert isinstance(module.PARAMS, dict)
     assert callable(module.generate_signals)
+
+
+def test_registry_refuses_other_interface_versions(tmp_path, monkeypatch):
+    source = "NAME = 'old_one'\nVERSION = 1\nINTERFACE = {}\nPARAMS = {{}}\n\ndef generate_signals(b, s, p):\n    return []\n"
+    (tmp_path / "old_one.py").write_text(source.format(strategies.INTERFACE_VERSION - 1))
+    (tmp_path / "current.py").write_text(source.format(strategies.INTERFACE_VERSION).replace("old_one", "current"))
+    monkeypatch.setattr(strategies, "STRATEGY_DIR", tmp_path)
+    monkeypatch.setattr(strategies, "__path__", [*strategies.__path__, str(tmp_path)])
+    for name in ("old_one", "current"):
+        monkeypatch.delitem(sys.modules, f"strategies.{name}", raising=False)
+    assert strategies.available() == ["current", "old_one"]
+    assert strategies.load("current").NAME == "current"
+    with pytest.raises(ValueError, match="targets interface"):
+        strategies.load("old_one")

@@ -31,36 +31,28 @@ def bumped(cfg, **changes):
     return new
 
 
-@pytest.mark.parametrize("path,allowed", [
+@pytest.mark.parametrize("path,allowed", [  # relative to the state directory (data/)
     ("config.json", True),
-    ("data/changelog.md", True),
-    ("data/reports/report_2026-10-06.md", True),
+    ("changelog.md", True),
+    ("reports/report_2026-10-06.md", True),
+    ("replay_check/trades.csv", True),
     ("strategies/orb_v2.py", True),
+    ("strategies/sub/orb.py", False),
+    ("strategies/Orb.py", False),
     ("tests/test_orb_v2.py", True),
-    ("config.shadow.json", True),
-    ("data/memory.md", True),
-    ("watchlist.json", True),
-    ("data/universe.json", False),
-    ("review/universe.py", False),
-    ("data/journal/2026-10-07.md", True),
-    ("data/journal/notes.md", False),
-    ("review/day_report.py", False),
-    ("strategies/__init__.py", False),
-    ("strategies/base.py", False),
-    ("tests/test_safety_strategies.py", False),
     ("tests/conftest.py", False),
-    ("trader.py", False),
-    ("broker.py", False),
-    ("risk.py", False),
-    ("analyze.py", False),
-    ("logger.py", False),
-    ("config.py", False),
-    ("simbroker.py", False),
-    ("config_bounds.json", False),
-    (".env", False),
-    ("review/guard.py", False),
-    ("review/REVIEW_PROMPT.md", False),
-    ("data/trades.csv", False),
+    ("config.shadow.json", True),
+    ("memory.md", True),
+    ("watchlist.json", True),
+    ("journal/2026-10-07.md", True),
+    ("journal/notes.md", False),
+    ("universe.json", False),
+    ("trades.csv", False),
+    ("orders.csv", False),
+    ("daily_summary.csv", False),
+    ("lifetime.md", False),
+    ("strategy_history/orb_v1.py", False),
+    ("trader.log", False),
 ])
 def test_path_allowlist(path, allowed):
     assert guard.path_allowed(path) is allowed
@@ -147,7 +139,7 @@ def test_memory_active_cap():
 
 
 def test_shipped_memory_file_is_valid():
-    text = (Path(__file__).resolve().parents[1] / "data" / "memory.md").read_text(encoding="utf-8")
+    text = (guard.STATE_DIR / "memory.md").read_text(encoding="utf-8")
     assert guard.memory_errors(text, text) == []
 
 
@@ -272,3 +264,89 @@ def test_risk_decrease_needs_no_evidence():
     change = [("risk.risk_per_trade_pct", 0.5, 0.25)]
     assert guard.evidence_errors(change, "", "", late_losers(), EV_TODAY) == []
     assert guard.evidence_errors([("risk.risk_per_trade_pct", 0.5, 0.75)], "", "", late_losers(), EV_TODAY)
+
+
+def make_state(root):
+    state = root / "data"
+    (state / "strategies").mkdir(parents=True)
+    (state / "journal").mkdir()
+    (state / "config.json").write_text('{"version": 1}')
+    (state / "trades.csv").write_text("date,pnl_usd\n")
+    (state / "journal" / "2026-10-06.md").write_text("# old day")
+    (state / "strategies" / "orb.py").write_text("NAME = 'orb'\nVERSION = 1\n")
+    return state
+
+
+def snap(tmp_path, state):
+    guard.snapshot(tmp_path / "snap", state_dir=state, framework=False)
+    return tmp_path / "snap"
+
+
+def changed(snapshot_dir, state):
+    before = guard.json.loads((snapshot_dir / "manifest.json").read_text())
+    return guard.changed_paths(before, guard.manifest(state))
+
+
+def test_snapshot_detects_changes_without_git(tmp_path):
+    state = make_state(tmp_path)
+    s = snap(tmp_path, state)
+    assert changed(s, state) == []
+    (state / "config.json").write_text('{"version": 2}')
+    (state / "journal" / "2026-10-07.md").write_text("# new day")
+    (state / "trades.csv").unlink()
+    (state / "strategies" / "__pycache__").mkdir()
+    (state / "strategies" / "__pycache__" / "orb.pyc").write_bytes(b"x")
+    paths = changed(s, state)
+    assert paths == ["config.json", "journal/2026-10-07.md", "trades.csv"]
+    assert guard.path_errors(paths) == ["data/trades.csv: the reviewer may not change this file"]
+
+
+def test_past_journal_edit_detected(tmp_path):
+    state = make_state(tmp_path)
+    s = snap(tmp_path, state)
+    (state / "journal" / "2026-10-06.md").write_text("# rewritten")
+    before = guard.json.loads((s / "manifest.json").read_text())
+    assert guard.journal_errors(before, changed(s, state))
+
+
+def test_revert_restores_snapshot_and_keeps_new_journal(tmp_path):
+    state = make_state(tmp_path)
+    s = snap(tmp_path, state)
+    (state / "config.json").write_text('{"version": 99}')
+    (state / "strategies" / "orb.py").write_text("broken")
+    (state / "strategies" / "new_one.py").write_text("NAME = 'new_one'\nVERSION = 1\n")
+    (state / "trades.csv").unlink()
+    (state / "journal" / "2026-10-07.md").write_text("# new day")
+    (state / "reports").mkdir()
+    (state / "reports" / "report.md").write_text("r")
+    guard.revert(s, state_dir=state, framework=False)
+    assert (state / "config.json").read_text() == '{"version": 1}'
+    assert "VERSION = 1" in (state / "strategies" / "orb.py").read_text()
+    assert not (state / "strategies" / "new_one.py").exists()
+    assert (state / "trades.csv").exists()
+    assert (state / "journal" / "2026-10-07.md").exists()
+    assert (state / "reports" / "report.md").exists()
+    assert changed(s, state) == ["journal/2026-10-07.md", "reports/report.md"]
+
+
+def test_strategy_edit_needs_version_bump(tmp_path):
+    state = make_state(tmp_path)
+    s = snap(tmp_path, state)
+    module = state / "strategies" / "orb.py"
+    module.write_text("NAME = 'orb'\nVERSION = 1\nX = 2\n")
+    assert any("without raising VERSION" in e for e in guard.strategy_version_errors(s, changed(s, state), state))
+    module.write_text("NAME = 'orb'\nVERSION = 2\nX = 2\n")
+    assert guard.strategy_version_errors(s, changed(s, state), state) == []
+
+
+def test_archive_keeps_every_version_and_blocks_reuse(tmp_path):
+    state = make_state(tmp_path)
+    assert guard.archive(state) == ["orb_v1.py"]
+    assert guard.archive(state) == []
+    s = snap(tmp_path, state)
+    module = state / "strategies" / "orb.py"
+    module.write_text("NAME = 'orb'\nVERSION = 2\n")
+    assert guard.archive(state) == ["orb_v2.py"]
+    assert (state / "strategy_history" / "orb_v1.py").read_text() == "NAME = 'orb'\nVERSION = 1\n"
+    module.write_text("NAME = 'orb'\nVERSION = 2\nX = 'different code, same version'\n")
+    assert any("already used" in e for e in guard.strategy_version_errors(s, changed(s, state), state))

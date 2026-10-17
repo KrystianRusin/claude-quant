@@ -17,7 +17,7 @@ from pathlib import Path
 import risk
 import strategies
 from broker import ET, DuplicateOrderError, make_broker
-from config import ConfigError, load_config, parse_hhmm
+from config import CONFIG_PATH, ConfigError, ensure_state, load_config, parse_hhmm
 from logger import TradeLog, setup_logging, trade_row
 from simbroker import RealClock, ReplaySource, SimBroker, SimClock, completed
 
@@ -541,14 +541,15 @@ def main(argv=None):
     mode.add_argument("--replay", nargs="+", metavar="YYYY-MM-DD")
     mode.add_argument("--replay-last", type=int, metavar="N")
     mode.add_argument("--flatten", action="store_true")
-    ap.add_argument("--config", default=ROOT / "config.json",
-                    help="config file for --dry-run/--replay (live always uses config.json)")
+    ap.add_argument("--config", default=CONFIG_PATH,
+                    help=f"config file for --dry-run/--replay (live always uses {CONFIG_PATH})")
     ap.add_argument("--data-dir", help="output directory for --dry-run/--replay")
     ap.add_argument("--equity", type=float, default=100_000.0, help="starting equity for --replay")
     args = ap.parse_args(argv)
     live = not (args.dry_run or args.replay or args.replay_last or args.flatten)
-    if live and (Path(args.config).resolve() != (ROOT / "config.json").resolve() or args.data_dir):
+    if live and (Path(args.config).resolve() != CONFIG_PATH.resolve() or args.data_dir):
         ap.error("--config and --data-dir are only allowed with --dry-run or --replay")
+    ensure_state()
     try:
         if args.flatten:
             return run_flatten(args)

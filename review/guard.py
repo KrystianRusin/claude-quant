@@ -1,14 +1,19 @@
 """Code-level checks on what a nightly review changed. Used by run_review.sh.
 
-python review/guard.py snapshot DIR                 save data files and untracked list before the review
-python review/guard.py check --base REV [--snapshot DIR] [--skip-replay]
+Everything the review may touch lives in the state directory (data/), which is gitignored and never
+committed. The baseline is a snapshot taken just before the review, not git.
+
+python review/guard.py snapshot DIR                 record the state (hashes + copies) before the review
+python review/guard.py check --snapshot DIR [--skip-replay]
                                                     exit 1 and list problems if the changes break a rule
-python review/guard.py revert --base REV --snapshot DIR
-                                                    undo every change made since REV
+python review/guard.py revert --snapshot DIR        undo every change made since the snapshot
+python review/guard.py archive                      save each strategy's current VERSION to strategy_history/
 """
 import argparse
 import ast
+import hashlib
 import json
+import os
 import re
 from datetime import date
 import shutil
@@ -19,7 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from config import BOUNDS_PATH, ConfigError, load_config, load_json  # noqa: E402
+from config import BOUNDS_PATH, STATE_DIR, ConfigError, load_config, load_json  # noqa: E402
 from analyze import evidence, format_evidence  # noqa: E402
 from logger import read_trades_frame  # noqa: E402
 
@@ -27,69 +32,87 @@ MIN_TRADES = 30
 MIN_DAYS = 10
 STRATEGY_MIN_DAYS = 10
 REPLAY_DAYS = 10
-DATA_FILES = ["data/trades.csv", "data/orders.csv", "data/daily_summary.csv", "data/universe.json"]
-EDITABLE_FILES = {"config.json", "config.shadow.json", "watchlist.json", "data/changelog.md", "data/memory.md"}
-JOURNAL = re.compile(r"^data/journal/\d{4}-\d{2}-\d{2}\.md$")
+# Paths below are relative to the state directory.
+EDITABLE_FILES = {"config.json", "config.shadow.json", "watchlist.json", "changelog.md", "memory.md"}
+OUTPUT_DIRS = ("reports/", "replay/", "replay_check/")  # written by tools the reviewer runs
+JOURNAL = re.compile(r"^journal/\d{4}-\d{2}-\d{2}\.md$")
+STRATEGY = re.compile(r"^strategies/[a-z][a-z0-9_]*\.py$")
+AGENT_TEST = re.compile(r"^tests/test_[a-z0-9_]+\.py$")
+SKIP_DIRS = {"__pycache__", ".pytest_cache"}
+HISTORY_DIR = "strategy_history"
 MEMORY_ENTRY = re.compile(r"^### (M-\d+):", re.MULTILINE)
 MEMORY_STATUSES = {"hypothesis", "supported", "confirmed", "retired"}
 MAX_ACTIVE_MEMORIES = 40
 MAX_MEMORY_BYTES = 60_000
-PROTECTED_STRATEGY_FILES = {"strategies/__init__.py", "strategies/base.py"}
 
 
-def git(*args, check=True):
-    return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True, check=check).stdout
+def files(state_dir):
+    """Every file under the state directory, as relative POSIX paths."""
+    state_dir = Path(state_dir)
+    for dirpath, dirnames, filenames in os.walk(state_dir):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for name in filenames:
+            yield (Path(dirpath) / name).relative_to(state_dir).as_posix()
 
 
-def changed_paths(base):
-    """Tracked files that differ from `base` (committed or not) plus new untracked files."""
-    tracked = git("diff", "--name-only", base).split()
-    untracked = git("ls-files", "--others", "--exclude-standard").split()
-    return sorted(set(tracked) | set(untracked))
+def manifest(state_dir):
+    """{relative path: sha256} for every file in the state directory."""
+    return {p: hashlib.sha256((Path(state_dir) / p).read_bytes()).hexdigest() for p in files(state_dir)}
+
+
+def changed_paths(before, after):
+    """Paths added, removed or modified between two manifests."""
+    return sorted(p for p in set(before) | set(after) if before.get(p) != after.get(p))
 
 
 def path_allowed(path):
-    if path in EDITABLE_FILES or path.startswith("data/reports/") or JOURNAL.match(path):
-        return True
-    if path.startswith("strategies/") and path.endswith(".py"):
-        return path not in PROTECTED_STRATEGY_FILES and path.count("/") == 1
-    if path.startswith("tests/test_") and path.endswith(".py"):
-        return not path.startswith("tests/test_safety")
-    return False
+    return (path in EDITABLE_FILES or path.startswith(OUTPUT_DIRS) or bool(JOURNAL.match(path))
+            or bool(STRATEGY.match(path)) or bool(AGENT_TEST.match(path)))
 
 
 def path_errors(paths):
-    return [f"{p}: the reviewer may not change this file" for p in paths if not path_allowed(p)]
+    return [f"data/{p}: the reviewer may not change this file" for p in paths if not path_allowed(p)]
 
 
-def exists_at(base, path):
-    return subprocess.run(["git", "cat-file", "-e", f"{base}:{path}"], cwd=ROOT,
-                          capture_output=True).returncode == 0
+def framework_status():
+    """Uncommitted changes to the framework checkout. data/ is gitignored, so this is code only."""
+    return set(subprocess.run(["git", "status", "--porcelain", "--no-renames", "-uall"], cwd=ROOT, capture_output=True,
+                              text=True, check=True).stdout.splitlines())
 
 
-def journal_errors(base, paths):
+def framework_errors(snap):
+    before = set(json.loads((Path(snap) / "framework.json").read_text(encoding="utf-8")))
+    return [f"{line[3:]}: the reviewer may not change framework code" for line in sorted(framework_status() - before)]
+
+
+def saved_text(snap, path):
+    """A file's content when the snapshot was taken, or "" if it did not exist."""
+    f = Path(snap) / "state" / path
+    return f.read_text(encoding="utf-8") if f.exists() else ""
+
+
+def journal_errors(before, paths):
     """Past journal entries are a record: they may be added, never edited."""
-    return [f"{p}: past journal entries must not be edited"
-            for p in paths if JOURNAL.match(p) and exists_at(base, p)]
+    return [f"data/{p}: past journal entries must not be edited" for p in paths if JOURNAL.match(p) and p in before]
 
 
 def memory_errors(old_text, new_text):
     """Entries are never deleted, the active list stays small, and every entry has a valid status."""
     errors = []
     if len(new_text.encode("utf-8")) > MAX_MEMORY_BYTES:
-        errors.append(f"data/memory.md is over {MAX_MEMORY_BYTES} bytes; merge or retire entries")
+        errors.append(f"memory.md is over {MAX_MEMORY_BYTES} bytes; merge or retire entries")
     missing = sorted(set(MEMORY_ENTRY.findall(old_text)) - set(MEMORY_ENTRY.findall(new_text)))
     if missing:
-        errors.append(f"data/memory.md: entries deleted instead of retired: {missing}")
+        errors.append(f"memory.md: entries deleted instead of retired: {missing}")
     active = new_text.split("## Retired")[0]
     n_active = len(MEMORY_ENTRY.findall(active))
     if n_active > MAX_ACTIVE_MEMORIES:
-        errors.append(f"data/memory.md: {n_active} active entries, max {MAX_ACTIVE_MEMORIES}")
+        errors.append(f"memory.md: {n_active} active entries, max {MAX_ACTIVE_MEMORIES}")
     blocks = MEMORY_ENTRY.split(new_text)[1:]
     for entry_id, body in zip(blocks[::2], blocks[1::2]):
         status = re.search(r"^- Status: *(\w+)", body, re.MULTILINE)
         if not status or status.group(1) not in MEMORY_STATUSES:
-            errors.append(f"data/memory.md {entry_id}: needs '- Status:' with one of {sorted(MEMORY_STATUSES)}")
+            errors.append(f"memory.md {entry_id}: needs '- Status:' with one of {sorted(MEMORY_STATUSES)}")
     return errors
 
 
@@ -101,19 +124,30 @@ def module_version(source):
     return None
 
 
-def strategy_version_errors(base, paths):
-    """An edited existing strategy module must raise its VERSION."""
+def history_path(state_dir, name, version):
+    return Path(state_dir) / HISTORY_DIR / f"{name}_v{version}.py"
+
+
+def strategy_version_errors(snap, paths, state_dir):
+    """An edited strategy must raise its VERSION, to a number not already archived with other code."""
     errors = []
     for p in paths:
-        if not (p.startswith("strategies/") and p.endswith(".py")) or p in PROTECTED_STRATEGY_FILES:
+        live = Path(state_dir) / p
+        if not STRATEGY.match(p) or not live.exists():
             continue
-        old = subprocess.run(["git", "show", f"{base}:{p}"], cwd=ROOT, capture_output=True, text=True)
-        if old.returncode != 0 or not (ROOT / p).exists():
-            continue
-        old_v, new_v = module_version(old.stdout), module_version((ROOT / p).read_text(encoding="utf-8"))
-        if not (isinstance(old_v, int) and isinstance(new_v, int) and new_v > old_v):
-            errors.append(f"{p}: edited in place without raising VERSION ({old_v} -> {new_v}); "
-                          "prefer a new module such as <name>_v2.py")
+        new_source = live.read_text(encoding="utf-8")
+        new_v = module_version(new_source)
+        old_source = saved_text(snap, p)
+        if old_source:
+            old_v = module_version(old_source)
+            if not (isinstance(old_v, int) and isinstance(new_v, int) and new_v > old_v):
+                errors.append(f"data/{p}: edited in place without raising VERSION ({old_v} -> {new_v}); "
+                              "prefer a new module such as <name>_v2.py")
+                continue
+        archived = history_path(state_dir, Path(p).stem, new_v)
+        if archived.exists() and archived.read_text(encoding="utf-8") != new_source:
+            errors.append(f"data/{p}: VERSION {new_v} was already used by different code "
+                          f"({archived.relative_to(state_dir)}); raise VERSION again")
     return errors
 
 
@@ -251,93 +285,122 @@ def watchlist_change_errors(old, new, universe, today, rules):
     return errors
 
 
-def run(cmd):
-    proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
+def run(cmd, env=None):
+    proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, env=env)
     return proc.returncode, (proc.stdout + proc.stderr)[-3000:]
 
 
-def check(base, snapshot=None, skip_replay=False):
-    paths = changed_paths(base)
-    errors = path_errors(paths) + strategy_version_errors(base, paths) + journal_errors(base, paths)
-    memory_path = ROOT / "data/memory.md"
+def agent_tests(state_dir):
+    """The strategy safety tests and the agent's own tests, both run against the agent's state."""
+    cmd = [sys.executable, "-m", "pytest", "-q", "-c", str(ROOT / "pytest.ini"), "-p", "quant_testing",
+           "tests/test_safety_strategies.py"]
+    if any(Path(state_dir, "tests").glob("test_*.py")):
+        cmd.append(str(Path(state_dir, "tests")))
+    return run(cmd, env={**os.environ, "QUANT_STATE_DIR": str(state_dir)})
+
+
+def check(snapshot, skip_replay=False, state_dir=STATE_DIR):
+    snap = Path(snapshot)
+    before = json.loads((snap / "manifest.json").read_text(encoding="utf-8"))
+    paths = changed_paths(before, manifest(state_dir))
+    errors = (path_errors(paths) + framework_errors(snap) + strategy_version_errors(snap, paths, state_dir)
+              + journal_errors(before, paths))
+    memory_path = Path(state_dir) / "memory.md"
     if memory_path.exists():
-        old_memory = subprocess.run(["git", "show", f"{base}:data/memory.md"], cwd=ROOT,
-                                    capture_output=True, text=True).stdout
-        errors += memory_errors(old_memory, memory_path.read_text(encoding="utf-8"))
-    if snapshot:
-        for f in DATA_FILES:
-            saved, live = Path(snapshot) / Path(f).name, ROOT / f
-            if saved.exists() != live.exists() or (saved.exists() and saved.read_bytes() != live.read_bytes()):
-                errors.append(f"{f}: data files must not be modified by the review")
+        errors += memory_errors(saved_text(snap, "memory.md"), memory_path.read_text(encoding="utf-8"))
     try:
-        new = load_config()
+        new = load_config(Path(state_dir) / "config.json", watchlist_path=Path(state_dir) / "watchlist.json")
     except ConfigError as e:
         return errors + [str(e)]
-    if (ROOT / "config.shadow.json").exists():
+    shadow = Path(state_dir) / "config.shadow.json"
+    if shadow.exists():
         try:
-            load_config(ROOT / "config.shadow.json")
+            load_config(shadow, watchlist_path=Path(state_dir) / "watchlist.json")
         except ConfigError as e:
             errors.append(f"config.shadow.json: {e}")
     new.pop("watchlist", None)
-    old = json.loads(git("show", f"{base}:config.json"))
+    old = json.loads(saved_text(snap, "config.json"))
     old.pop("watchlist", None)
-    trades = read_trades_frame(ROOT / "data/trades.csv")
+    try:
+        trades = read_trades_frame(Path(state_dir) / "trades.csv")
+    except (KeyError, ValueError) as e:
+        return errors + [f"data/trades.csv is unreadable ({e!r}); cannot check the config change"]
     errors += config_change_errors(old, new, trades)
     switched = old["strategy"]["name"] != new["strategy"]["name"] or old["strategy_version"] != new["strategy_version"]
     if not switched:
         changes = [c for c in leaf_changes(old, new) if c[0] not in ("version", "strategy_version")]
-        old_log = subprocess.run(["git", "show", f"{base}:data/changelog.md"], cwd=ROOT,
-                                 capture_output=True, text=True).stdout.replace("\r\n", "\n")
-        new_log = (ROOT / "data/changelog.md").read_text(encoding="utf-8").replace("\r\n", "\n")
+        old_log = saved_text(snap, "changelog.md").replace("\r\n", "\n")
+        new_log = (Path(state_dir) / "changelog.md").read_text(encoding="utf-8").replace("\r\n", "\n")
         added_log = new_log[len(old_log):] if new_log.startswith(old_log) else new_log
-        base_memory = subprocess.run(["git", "show", f"{base}:data/memory.md"], cwd=ROOT,
-                                     capture_output=True, text=True).stdout
-        errors += evidence_errors(changes, added_log, base_memory,
+        errors += evidence_errors(changes, added_log, saved_text(snap, "memory.md"),
                                   trades[trades["config_version"] == old["version"]], date.today())
-    if exists_at(base, "watchlist.json"):
-        universe_path = ROOT / "data/universe.json"
+    old_watchlist = saved_text(snap, "watchlist.json")
+    if old_watchlist:
+        universe_path = Path(state_dir) / "universe.json"
         universe = json.loads(universe_path.read_text(encoding="utf-8")) if universe_path.exists() else None
-        errors += watchlist_change_errors(json.loads(git("show", f"{base}:watchlist.json")),
-                                          load_json(ROOT / "watchlist.json"), universe, date.today(),
-                                          load_json(BOUNDS_PATH)["watchlist_rules"])
-    code, out = run([sys.executable, "-m", "pytest", "-q"])
+        errors += watchlist_change_errors(json.loads(old_watchlist), load_json(Path(state_dir) / "watchlist.json"),
+                                          universe, date.today(), load_json(BOUNDS_PATH)["watchlist_rules"])
+    code, out = agent_tests(state_dir)
     if code != 0:
         errors.append(f"pytest failed:\n{out}")
-    strategy_touched = any(p.startswith("strategies/") for p in paths)
+    strategy_touched = any(STRATEGY.match(p) for p in paths)
     switched = switched or old["strategy"] != new["strategy"]
     if (strategy_touched or switched) and not skip_replay:
         code, out = run([sys.executable, "trader.py", "--replay-last", str(REPLAY_DAYS),
-                         "--data-dir", "data/replay_check"])
+                         "--data-dir", str(Path(state_dir) / "replay_check")])
         if code != 0:
             errors.append(f"replay over the last {REPLAY_DAYS} days failed:\n{out}")
     return errors
 
 
-def snapshot(dest):
+def snapshot(dest, state_dir=STATE_DIR, framework=True):
+    """Hash every state file and copy all but the bulky tool outputs, so revert can restore them."""
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
-    for f in DATA_FILES:
-        if (ROOT / f).exists():
-            shutil.copy2(ROOT / f, dest / Path(f).name)
-    (dest / "untracked.txt").write_text(git("ls-files", "--others", "--exclude-standard"), encoding="utf-8")
+    (dest / "manifest.json").write_text(json.dumps(manifest(state_dir)), encoding="utf-8")
+    for p in files(state_dir):
+        if not p.startswith(OUTPUT_DIRS):
+            (dest / "state" / p).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(Path(state_dir) / p, dest / "state" / p)
+    if framework:
+        (dest / "framework.json").write_text(json.dumps(sorted(framework_status())), encoding="utf-8")
 
 
-def revert(base, snap):
-    """Undo every change since `base`, except a newly added journal entry, which is kept as a record."""
-    before = set((Path(snap) / "untracked.txt").read_text(encoding="utf-8").split())
-    for p in git("diff", "--name-only", base).split():
-        if exists_at(base, p):
-            git("checkout", base, "--", p)
-        elif not JOURNAL.match(p):
-            git("rm", "-q", "-f", "--", p, check=False)
-            (ROOT / p).unlink(missing_ok=True)
-    for p in git("ls-files", "--others", "--exclude-standard").split():
-        if p not in before and not JOURNAL.match(p):
-            (ROOT / p).unlink(missing_ok=True)
-    for f in DATA_FILES:
-        saved = Path(snap) / Path(f).name
+def revert(snapshot, state_dir=STATE_DIR, framework=True):
+    """Undo every change since the snapshot. New journal entries and tool outputs are kept as a record."""
+    snap = Path(snapshot)
+    before = json.loads((snap / "manifest.json").read_text(encoding="utf-8"))
+    for p in changed_paths(before, manifest(state_dir)):
+        saved, live = snap / "state" / p, Path(state_dir) / p
         if saved.exists():
-            shutil.copy2(saved, ROOT / f)
+            live.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(saved, live)
+        elif not (JOURNAL.match(p) or p.startswith(OUTPUT_DIRS)):
+            live.unlink(missing_ok=True)
+    if framework:
+        baseline = set(json.loads((snap / "framework.json").read_text(encoding="utf-8")))
+        for line in sorted(framework_status() - baseline):
+            path = line[3:]
+            if line.startswith("??"):
+                (ROOT / path).unlink(missing_ok=True)
+            else:
+                subprocess.run(["git", "checkout", "--", path], cwd=ROOT, check=False)
+
+
+def archive(state_dir=STATE_DIR):
+    """Copy each strategy's current code to strategy_history/<name>_v<VERSION>.py if not already there.
+
+    Trades record strategy and strategy_version, so every result maps back to the exact code.
+    """
+    saved = []
+    for module in sorted(Path(state_dir, "strategies").glob("*.py")):
+        version = module_version(module.read_text(encoding="utf-8"))
+        dest = history_path(state_dir, module.stem, version)
+        if isinstance(version, int) and not dest.exists():
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(module, dest)
+            saved.append(dest.name)
+    return saved
 
 
 def main(argv=None):
@@ -346,19 +409,21 @@ def main(argv=None):
     s = sub.add_parser("snapshot")
     s.add_argument("dir")
     c = sub.add_parser("check")
-    c.add_argument("--base", required=True)
-    c.add_argument("--snapshot")
+    c.add_argument("--snapshot", required=True)
     c.add_argument("--skip-replay", action="store_true")
     r = sub.add_parser("revert")
-    r.add_argument("--base", required=True)
     r.add_argument("--snapshot", required=True)
+    sub.add_parser("archive")
     args = ap.parse_args(argv)
     if args.cmd == "snapshot":
         snapshot(args.dir)
     elif args.cmd == "revert":
-        revert(args.base, args.snapshot)
+        revert(args.snapshot)
+    elif args.cmd == "archive":
+        for name in archive():
+            print(f"archived {name}")
     else:
-        errors = check(args.base, args.snapshot, args.skip_replay)
+        errors = check(args.snapshot, args.skip_replay)
         for e in errors:
             print(f"GUARD: {e}")
         print("GUARD: ok" if not errors else f"GUARD: {len(errors)} problem(s)")

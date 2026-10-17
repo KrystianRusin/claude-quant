@@ -3,7 +3,7 @@
 cd "$(dirname "$0")/.."
 py=.venv/bin/python
 [ -x "$py" ] || py=.venv/Scripts/python.exe
-if [ -f config.shadow.json ]; then
-  "$py" trader.py --dry-run --config config.shadow.json --data-dir data/shadow >/dev/null 2>&1 &
+if [ -f data/config.shadow.json ]; then
+  "$py" trader.py --dry-run --config data/config.shadow.json --data-dir data/shadow >/dev/null 2>&1 &
 fi
 exec "$py" trader.py

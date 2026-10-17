@@ -1,5 +1,9 @@
 # Paper Day Trading Bot: Design Spec
 
+> Original design spec, kept for context. Where it differs, README.md is current. In particular,
+> runtime state (config, watchlist, strategies, memory, changelog) now lives in the gitignored
+> `data/` folder and the nightly review never commits.
+
 ## 1. Goal
 
 Build an automated paper day trading system on Alpaca's free paper API. It runs a rule-based strategy each market morning, logs every trade, produces performance analytics, and has a nightly review job where Claude Code reads the results and tunes the strategy config within strict guardrails.

@@ -6,7 +6,8 @@
 #
 # Installs system packages, the Python venv and packages, the Claude Code CLI, writes .env
 # with your Alpaca paper keys, stores a Claude token for the nightly review, sets the
-# timezone, runs the tests and the Alpaca connection check, and installs the cron jobs.
+# timezone, creates the runtime state in data/ from defaults/, runs the tests and the Alpaca
+# connection check, and installs the cron jobs.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO="$PWD"
@@ -101,16 +102,9 @@ else
   echo "Warning: 'claude -p' did not answer ok. Check the token, then re-run this script."
 fi
 
-step "Git identity (the nightly review commits config changes)"
-if git config user.name >/dev/null && git config user.email >/dev/null; then
-  echo "OK: $(git config user.name) <$(git config user.email)>"
-else
-  read -r -p "git user.name: " gname
-  read -r -p "git user.email: " gemail
-  git config user.name "$gname"
-  git config user.email "$gemail"
-fi
-git rev-parse HEAD >/dev/null 2>&1 || echo "Warning: no commits yet. The review needs at least one commit."
+step "Runtime state (data/)"
+.venv/bin/python config.py
+.venv/bin/python review/guard.py archive
 
 step "Tests"
 .venv/bin/python -m pytest -q

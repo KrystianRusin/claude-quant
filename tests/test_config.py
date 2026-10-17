@@ -121,3 +121,41 @@ def test_load_config_raises(tmp_path, cfg):
     path.write_text(json.dumps(cfg))
     with pytest.raises(ConfigError, match="risk_per_trade_pct"):
         load_config(config_path=path)
+
+
+def test_ensure_state_seeds_missing_files_and_never_overwrites(tmp_path):
+    from config import DEFAULTS_DIR, ensure_state
+
+    state = tmp_path / "data"
+    created = ensure_state(state, DEFAULTS_DIR)
+    assert "created config.json" in created and "created strategies/" in created
+    assert (state / "strategies" / "opening_range_breakout.py").exists()
+    assert (state / "tests" / "test_opening_range_breakout.py").exists()
+    (state / "memory.md").write_text("agent memory")
+    (state / "strategies" / "opening_range_breakout.py").unlink()
+    assert ensure_state(state, DEFAULTS_DIR) == []
+    assert (state / "memory.md").read_text() == "agent memory"
+    assert not (state / "strategies" / "opening_range_breakout.py").exists()  # the agent deleted it
+
+
+def test_ensure_state_merges_new_framework_keys(tmp_path):
+    from config import ensure_state
+
+    defaults, state = tmp_path / "defaults", tmp_path / "data"
+    defaults.mkdir()
+    state.mkdir()
+    (defaults / "config.json").write_text(json.dumps(
+        {"version": 1, "risk": {"a": 1, "new_limit": 5}, "new_section": {"x": 1},
+         "strategy": {"name": "seed", "seed_param": 1}}))
+    (state / "config.json").write_text(json.dumps(
+        {"version": 7, "risk": {"a": 3, "retired": 2}, "strategy": {"name": "mine", "my_param": 9}}))
+    assert ensure_state(state, defaults) == ["merged new framework keys into config.json"]
+    assert json.loads((state / "config.json").read_text()) == {
+        "version": 7, "risk": {"a": 3, "new_limit": 5}, "new_section": {"x": 1},
+        "strategy": {"name": "mine", "my_param": 9}}
+
+
+def test_ensure_state_is_a_no_op_on_the_defaults_themselves():
+    from config import DEFAULTS_DIR, ensure_state
+
+    assert ensure_state(DEFAULTS_DIR, DEFAULTS_DIR) == []

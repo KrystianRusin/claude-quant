@@ -1,17 +1,29 @@
-"""Load config.json and watchlist.json and validate them against config_bounds.json.
+"""Load the config and watchlist and validate them against config_bounds.json.
 
-Run `python config.py` to validate the current config and watchlist from the command line.
+The framework (this repo) ships seeds in defaults/. Everything the agent writes lives in the state
+directory, data/ by default (QUANT_STATE_DIR overrides it; the tests point it at defaults/).
+It is gitignored and never committed.
+
+Run `python config.py` to create missing state from the defaults, merge config keys added by a
+framework update, and validate the config and watchlist.
 """
 import json
+import os
 import re
+import shutil
 import sys
 from datetime import datetime, time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-CONFIG_PATH = ROOT / "config.json"
+DEFAULTS_DIR = ROOT / "defaults"
+STATE_DIR = Path(os.environ.get("QUANT_STATE_DIR", ROOT / "data")).resolve()
+CONFIG_PATH = STATE_DIR / "config.json"
+WATCHLIST_PATH = STATE_DIR / "watchlist.json"
+SHADOW_CONFIG_PATH = STATE_DIR / "config.shadow.json"
 BOUNDS_PATH = ROOT / "config_bounds.json"
-WATCHLIST_PATH = ROOT / "watchlist.json"
+SEED_FILES = ("config.json", "watchlist.json", "memory.md", "changelog.md")
+SEED_DIRS = ("strategies", "tests")
 MARKET_OPEN = time(9, 30)
 SYMBOL = re.compile(r"^[A-Z]{1,5}$")
 NOT_CONFIG = ("strategy", "strategy_params", "watchlist_rules", "universe")
@@ -105,7 +117,7 @@ def _strategy_errors(config, bounds):
     errors = _walk({k: v for k, v in section.items() if k != "name"}, {**common, **params}, "strategy.")
     if not isinstance(config.get("strategy_version"), int) or config["strategy_version"] != module.VERSION:
         errors.append(f"strategy_version: config says {config.get('strategy_version')!r} "
-                      f"but strategies/{name}.py has VERSION = {module.VERSION}")
+                      f"but {module.__file__} has VERSION = {module.VERSION}")
     if not errors:
         if parse_hhmm(section["entry_window_end"]) <= MARKET_OPEN:
             errors.append("strategy: entry_window_end must be after the market open")
@@ -179,11 +191,64 @@ def load_config(config_path=CONFIG_PATH, bounds_path=BOUNDS_PATH, watchlist_path
     return config
 
 
+def merge_new_keys(current, default):
+    """Add keys the defaults have and `current` lacks, drop keys the defaults no longer have.
+
+    Recurses into sections. The strategy section belongs to the strategy module, so it is left alone.
+    """
+    out = {}
+    for key, value in default.items():
+        if key not in current:
+            out[key] = value
+        elif key != "strategy" and isinstance(value, dict) and isinstance(current[key], dict):
+            out[key] = merge_new_keys(current[key], value)
+        else:
+            out[key] = current[key]
+    if "strategy" in current:
+        out["strategy"] = current["strategy"]
+    return out
+
+
+def ensure_state(state_dir=STATE_DIR, defaults_dir=DEFAULTS_DIR):
+    """Create missing state files from the defaults (never overwriting), then merge new config keys.
+
+    A seed folder is copied only when the state has none, so strategies or tests the agent
+    deleted stay deleted. Returns a list of what changed.
+    """
+    state_dir, defaults_dir = Path(state_dir), Path(defaults_dir)
+    if state_dir.resolve() == defaults_dir.resolve():
+        return []
+    state_dir.mkdir(parents=True, exist_ok=True)
+    changed = []
+    for name in SEED_FILES:
+        if not (state_dir / name).exists() and (defaults_dir / name).exists():
+            shutil.copy2(defaults_dir / name, state_dir / name)
+            changed.append(f"created {name}")
+    for name in SEED_DIRS:
+        if not (state_dir / name).exists() and (defaults_dir / name).is_dir():
+            shutil.copytree(defaults_dir / name, state_dir / name,
+                            ignore=shutil.ignore_patterns("__pycache__"))
+            changed.append(f"created {name}/")
+    for path in (state_dir / "config.json", state_dir / "config.shadow.json"):
+        if not path.exists():
+            continue
+        current = load_json(path)
+        merged = merge_new_keys(current, load_json(defaults_dir / "config.json"))
+        if merged != current:
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
+            tmp.replace(path)
+            changed.append(f"merged new framework keys into {path.name}")
+    return changed
+
+
 if __name__ == "__main__":
+    for change in ensure_state():
+        print(change)
     try:
         cfg = load_config()
     except ConfigError as e:
         print(e)
         sys.exit(1)
-    print(f"config.json and watchlist.json are valid (version {cfg['version']}, "
+    print(f"{CONFIG_PATH} and {WATCHLIST_PATH.name} are valid (version {cfg['version']}, "
           f"{len(cfg['watchlist'])} symbols: {' '.join(cfg['watchlist'])})")

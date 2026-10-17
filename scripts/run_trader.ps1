@@ -2,9 +2,9 @@
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 $py = Join-Path $root ".venv\Scripts\python.exe"
-if (Test-Path "config.shadow.json") {
+if (Test-Path "data\config.shadow.json") {
     Start-Process -FilePath $py -WorkingDirectory $root -WindowStyle Hidden `
-        -ArgumentList "trader.py --dry-run --config config.shadow.json --data-dir data/shadow"
+        -ArgumentList "trader.py --dry-run --config data/config.shadow.json --data-dir data/shadow"
 }
 & $py trader.py
 exit $LASTEXITCODE

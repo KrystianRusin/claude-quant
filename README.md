@@ -59,10 +59,24 @@ never commit it. Keys are only read from the environment or `.env` and are never
 This confirms the endpoint is paper, prints the account, recent trading days and a few SPY
 1-minute bars from IEX.
 
-### 5. Git
+### 5. Runtime state
 
-The nightly review commits config changes, so the repo must be a git repository with at least
-one commit and a configured `user.name` / `user.email`.
+```bash
+.venv/Scripts/python config.py
+```
+
+The repo is the framework. Everything the system produces at runtime lives in `data/`, which is
+gitignored and never committed: the active config and watchlist, Claude's strategies and their
+tests, memory, journal, changelog, trade logs and reports. `python config.py` creates whatever is
+missing from the seeds in `defaults/` (it never overwrites), merges config keys added by a framework
+update, and validates the result. The trader runs it on every start too.
+
+| Framework (git) | Runtime state (`data/`, never committed) |
+|---|---|
+| Code, `strategies/base.py` (the strategy interface) and the registry | `data/strategies/*.py`, `data/tests/` |
+| `config_bounds.json` (hard limits) | `data/config.json`, `data/watchlist.json`, `data/config.shadow.json` |
+| `defaults/` (seeds for a fresh install) | `data/memory.md`, `data/changelog.md`, `data/journal/` |
+| `tests/` (framework tests, run in CI) | trades, orders, summaries, logs, reports, `data/strategy_history/` |
 
 ## Daily use
 
@@ -111,11 +125,13 @@ including ones you opened by hand.
 | `data/daily_summary.csv` | One row per trading day. |
 | `data/trader.log` | Session log with error tracebacks. |
 | `data/changelog.md` | Every review entry and config or strategy change, with reasoning. |
-| `data/lifetime.md` | All-time record since day one: totals, equity and drawdown, records, monthly and yearly tables, per strategy and config version. Regenerated and committed before each nightly review. |
+| `data/lifetime.md` | All-time record since day one: totals, equity and drawdown, records, monthly and yearly tables, per strategy and config version. Regenerated before each nightly review. |
 | `data/universe.json` | Tonight's screened universe with liquidity and movement stats. |
 | `data/reports/` | Analytics reports and nightly review logs. |
+| `data/strategy_history/` | Every accepted version of every strategy, as `<name>_v<VERSION>.py`. |
 
-The CSVs are git-ignored. Back them up if you move machines.
+All of `data/` is git-ignored, including Claude's config, strategies and memory. Back it up if you
+move machines.
 
 ## Scheduling
 
@@ -164,20 +180,23 @@ changelog entry, and changes things only when the evidence is strong enough:
   a 95% range that excludes zero, and 10+ trades since it was written down pointing the same way.
   Ranges group trades by day, since same-day trades are partly the same bet. Writing hypotheses
   down first stops the reviewer from searching until something looks significant by chance.
-- It may write a new strategy module under `strategies/` (with tests and a 10-day in-sample replay)
-  at most once per 10 trading days.
+- It may write a new strategy module under `data/strategies/` (with tests in `data/tests/` and a
+  10-day in-sample replay) at most once per 10 trading days.
 
-After Claude exits, `review/guard.py` re-checks every rule in code and reverts anything that fails:
-files outside the allowlist, edits to the trade data, an invalid config, more than one change,
-too little evidence, risk increases after losses, strategy edits without a version bump, failing
-tests, or a failing replay. The run log goes to `data/reports/review_<date>.log`.
+Nothing is committed. Before Claude starts, `review/guard.py snapshot` hashes and copies `data/`.
+After Claude exits, `review/guard.py check` re-checks every rule in code against that snapshot and
+reverts anything that fails: files outside the allowlist, any change to framework code, edits to the
+trade data, an invalid config, more than one change, too little evidence, risk increases after
+losses, strategy edits without a version bump, a strategy written for another interface version,
+failing tests, or a failing replay. Accepted strategy versions are archived to
+`data/strategy_history/`. The run log goes to `data/reports/review_<date>.log`.
 
 ### Watchlist and universe
 
 Claude picks the watchlist. Before each review, `review/universe.py` screens every US stock and ETF
 on free full-market daily bars: price at least $10, at least $300M average daily dollar volume,
 leveraged and inverse ETFs excluded, top 300 kept, with each symbol's average range and gap.
-The reviewer can swap symbols in `watchlist.json` from that list: at most 3 adds and 3 removes per
+The reviewer can swap symbols in `data/watchlist.json` from that list: at most 3 adds and 3 removes per
 review, 5 to 25 symbols, each with the date and reason, removals logged, and a 10-day wait before
 a removed symbol returns. Swaps do not bump the config version, so parameter evidence keeps
 accumulating. The screening criteria and swap limits live in `config_bounds.json`.
@@ -197,18 +216,24 @@ instead of editing anything, if you prefer to approve changes yourself.
 
 ### Shadow mode (optional, off by default)
 
-If the reviewer (or you) writes `config.shadow.json` selecting a candidate strategy, the scheduled
+If the reviewer (or you) writes `data/config.shadow.json` selecting a candidate strategy, the scheduled
 launcher also runs it in `--dry-run` alongside the live strategy, logging to `data/shadow/`.
 Compare with `python analyze.py --data-dir data/shadow --no-baseline --out ""`. Delete the file to
 turn shadow mode off.
 
 ## Strategies
 
-Each strategy is a module `strategies/<name>.py` exposing `NAME`, `VERSION`, `PARAMS` (bounds for
-its own config keys) and `generate_signals(bars, state, params)`. It returns signals only: symbol,
-side, reference price, stop and target. Sizing, stop-distance limits, order caps and halts live in
-`risk.py` and `trader.py`. `config.json` selects the active strategy with `strategy.name`, and
-`strategy_version` must match the module's `VERSION`.
+Strategies are runtime state, written by Claude: each is a module `data/strategies/<name>.py`
+exposing `NAME`, `VERSION`, `INTERFACE`, `PARAMS` (bounds for its own config keys) and
+`generate_signals(bars, state, params)`. It returns signals only: symbol, side, reference price, stop
+and target. Sizing, stop-distance limits, order caps and halts live in `risk.py` and `trader.py`.
+`data/config.json` selects the active strategy with `strategy.name`, and `strategy_version` must
+match the module's `VERSION`. A fresh install is seeded with `defaults/strategies/opening_range_breakout.py`.
+
+The framework side is `strategies/base.py` (the interface) and `strategies/__init__.py` (the
+registry, which imports modules from `data/strategies/` as `strategies.<name>`). `INTERFACE` must
+equal `INTERFACE_VERSION` in `base.py`. Raise `INTERFACE_VERSION` whenever a framework change breaks
+the contract; the registry then refuses strategies written for the old one instead of running them.
 
 ## Swapping the broker
 
@@ -224,7 +249,7 @@ Strategies and `risk.py` do not change.
 
 - Watchlist: picked by the reviewer from the nightly universe. A pre-market gap scanner could come later.
 - Whether this machine will reliably be on at 09:20 ET every trading day.
-- Whether the nightly review auto-commits changes (default) or only proposes them (`REVIEW_MODE=propose`).
+- Whether the nightly review applies changes that pass the guard (default) or only proposes them (`REVIEW_MODE=propose`).
 
 ## Tests
 

@@ -10,6 +10,7 @@ from strategies.base import Signal
 
 NAME = "opening_range_breakout"
 VERSION = 1
+INTERFACE = 1
 PARAMS = {
     "opening_range_minutes": {"type": "int", "min": 5, "max": 60},
     "stop_loss_r": {"type": "float", "min": 0.25, "max": 1.5},

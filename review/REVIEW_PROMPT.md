@@ -1,5 +1,10 @@
 You are the nightly reviewer for a paper day trading bot. The repo root is the current directory.
 The trading code is deterministic; you design and tune the strategy, you do not trade.
+
+The repo is the framework: execution, risk limits, replay, analysis and this review loop. Everything
+you produce lives in `data/`: the config, the watchlist, strategies and their tests, memory, the
+changelog and the journal. `data/` is not in git and nothing is ever committed. Your changes take
+effect when the guard accepts them at the end of the review.
 Today's date is in the shell (`date +%F`). Work through the steps below, then stop.
 
 ## 1. Read memory first
@@ -67,9 +72,9 @@ the data until something looks significant by chance.
 ## 4. Read the performance evidence
 
 1. Run `python analyze.py` (writes `data/reports/report_<date>.md` and prints it). Also run it with
-   `--config-version N` for the current `version` in `config.json`.
+   `--config-version N` for the current `version` in `data/config.json`.
 2. Read `data/lifetime.md` (all-time record since day one, regenerated before you start),
-   `data/daily_summary.csv`, `data/changelog.md`, `config.json` and `config_bounds.json`.
+   `data/daily_summary.csv`, `data/changelog.md`, `data/config.json` and `config_bounds.json`.
 3. Only `data/trades.csv` counts as evidence. Results under `data/replay*/` and `data/dry_run/` are
    simulations and must never be mixed into it.
 
@@ -81,7 +86,7 @@ If you switch strategy, put `**STRATEGY SWITCH**` as the first line of the entry
 
 ## 6. Default to no change
 
-Change `config.json` only if all of these hold:
+Change `data/config.json` only if all of these hold:
 
 - At least 30 closed trades and at least 10 distinct trading days under the current `version`.
   Trades on the same day share market conditions, so the day count matters as much as the trade count.
@@ -109,7 +114,7 @@ result could be noise. A small sample with a striking result is still a small sa
 
 ## 7. Watchlist
 
-You choose the watchlist. `watchlist.json` lists the symbols the strategy trades, each with the
+You choose the watchlist. `data/watchlist.json` lists the symbols the strategy trades, each with the
 date it was added and why, plus a history of removals. The wrapper refreshes `data/universe.json`
 before you start: the liquid US stocks and ETFs (price, average dollar volume, average daily range %,
 average opening gap %, shortability), screened by rules in `config_bounds.json`. Leveraged and
@@ -141,14 +146,19 @@ How to choose:
 If parameter tweaks are not helping (for example expectancy is still negative after 60+ trades
 across at least two config versions), stop patching parameters and consider a strategy change.
 
-- Each strategy is a module `strategies/<name>.py` with `NAME`, `VERSION`, `PARAMS` and
-  `generate_signals(bars, state, params) -> list[Signal]` (see `strategies/base.py` and
-  `strategies/opening_range_breakout.py`). `config.json` picks one with `strategy.name`, and
-  `strategy_version` must equal the module's `VERSION`.
+- Each strategy is a module `data/strategies/<name>.py` with `NAME`, `VERSION`, `INTERFACE`, `PARAMS`
+  and `generate_signals(bars, state, params) -> list[Signal]` (see `strategies/base.py` for the
+  interface and `defaults/strategies/opening_range_breakout.py` for an example). `INTERFACE` must equal
+  `INTERFACE_VERSION` in `strategies/base.py`. Import shared types with `from strategies.base import ...`
+  and other strategies with `from strategies.<name> import ...`. `data/config.json` picks one with
+  `strategy.name`, and `strategy_version` must equal the module's `VERSION`.
+- Every accepted version is archived to `data/strategy_history/<name>_v<VERSION>.py`, so results in
+  `data/trades.csv` (which record `strategy` and `strategy_version`) always map to the exact code.
 - Signals only: a strategy never places orders, imports `broker`, or does file or network I/O.
   `tests/test_safety_strategies.py` enforces this.
 - Prefer adding over editing: write a new module (for example `orb_v2.py`) rather than rewriting the
-  active one, so a revert is one config change. If you must edit a module in place, raise its `VERSION`.
+  active one, so a revert is one config change. If you must edit a module in place, raise its `VERSION`
+  (to a number not already in `data/strategy_history/`).
 - New strategy parameters need bounds in the module's `PARAMS`. Parameters already listed under
   `strategy_params` in `config_bounds.json` use those bounds.
 - At most one strategy change per 10 trading days on the current strategy version.
@@ -156,38 +166,37 @@ across at least two config versions), stop patching parameters and consider a st
 Before switching the active strategy:
 
 1. Write the hypothesis in the changelog: the evidence that prompted it and what it should improve.
-2. Add unit tests for the new strategy in `tests/test_<name>.py` and make `python -m pytest -q` pass.
+2. Add unit tests for the new strategy in `data/tests/test_<name>.py` and make
+   `python -m pytest -q tests/test_safety_strategies.py data/tests` pass.
 3. Run `python trader.py --replay-last 10 --data-dir data/replay_check` with no errors, and record the
    results in the changelog labeled **in-sample** (a sanity check, not proof).
    `python analyze.py --data-dir data/replay_check --no-baseline --out ""` summarizes them.
 4. Bump `strategy_version` and `version`.
 
-If tests or the replay fail, undo your strategy work with git (`git checkout -- <file>` or delete the
-new file) and log what happened.
+If tests or the replay fail, undo your strategy work (delete the new file, or edit it back) and log
+what happened. Anything still failing at the end is reverted by the guard.
 
-Optional shadow mode (off unless `config.shadow.json` exists): instead of switching, you may write
-`config.shadow.json` selecting the new strategy. The scheduler then runs it in `--dry-run` alongside
+Optional shadow mode (off unless `data/config.shadow.json` exists): instead of switching, you may write
+`data/config.shadow.json` selecting the new strategy. The scheduler then runs it in `--dry-run` alongside
 the live strategy, logging to `data/shadow/`. After 5+ trading days, promote it only if its shadow
 results (`python analyze.py --data-dir data/shadow --no-baseline --out ""`) are not worse.
 
 ## 9. Protected files
 
-Never edit: `trader.py`, `broker.py`, `simbroker.py`, `risk.py`, `analyze.py`, `lifetime.py`,
-`logger.py`, `config.py`, `config_bounds.json`, `.env`, anything in `review/`, `strategies/__init__.py`,
-`strategies/base.py`, `tests/conftest.py`, `tests/helpers.py`, any `tests/test_safety*` file,
-and the data files `data/trades.csv`, `data/orders.csv`, `data/daily_summary.csv`,
-`data/universe.json`, `data/lifetime.md`.
+You may only change these, all under `data/`: `config.json`, `config.shadow.json`, `watchlist.json`,
+`changelog.md`, `memory.md`, new `journal/<today>.md`, `strategies/<name>.py` and `tests/test_<name>.py`.
+Everything outside `data/` is framework code and off limits, and so are the data files
+`data/trades.csv`, `data/orders.csv`, `data/daily_summary.csv`, `data/universe.json`,
+`data/lifetime.md` and `data/strategy_history/`.
 Do not change how results are measured and do not weaken any safety limit.
 
-## 10. Commit
+## 10. Self-check
 
-1. Self-check: `python review/guard.py check --base HEAD --skip-replay` (it also runs pytest).
-2. If you changed `config.json`, `watchlist.json` or strategy files, commit them together with the changelog,
-   journal and memory: `git add config.json watchlist.json data/changelog.md data/journal data/memory.md strategies tests` then
-   `git commit -m "<what changed>: <evidence and reasoning in one line>"`.
-3. If you changed no config, watchlist or strategy, leave the changelog, journal and memory uncommitted;
-   the wrapper commits them.
+Run `python review/guard.py check --snapshot "$REVIEW_SNAPSHOT" --skip-replay` (it also runs the
+strategy safety tests and `data/tests`), and fix anything it reports. There is nothing to commit.
 
 After you finish, `review/run_review.sh` re-checks every rule in code (allowed files, data files
-untouched, past journals unedited, memory entries never deleted, watchlist swap limits, config bounds, one change per review, trade and day minimums, risk increases, strategy
-version bumps, pytest, and a 10-day replay after strategy changes). Anything that fails is reverted.
+untouched, framework untouched, past journals unedited, memory entries never deleted, watchlist swap
+limits, config bounds, one change per review, trade and day minimums, risk increases, strategy
+version bumps, the strategy interface, tests, and a 10-day replay after strategy changes). Anything
+that fails is reverted; everything that passes is kept.
