@@ -159,12 +159,31 @@ Also set the power plan so the machine does not sleep during market hours.
 
 ### Linux / macOS (cron)
 
-`crontab -e`, with the system clock on Eastern time (or adjust the hours):
+`scripts/cron.sh install` (run by `scripts/setup.sh`) installs the schedule, with the system clock
+on Eastern time: the trader weekdays at 09:00, the review weekdays at 17:00, and the deploy check
+every 5 minutes. `scripts/cron.sh print` shows the lines.
 
-```cron
-20 9 * * 1-5  /path/to/claude-trade/scripts/run_trader.sh >> /path/to/claude-trade/data/cron.log 2>&1
-0 17 * * 1-5  /path/to/claude-trade/review/run_review.sh
-```
+## Continuous deployment
+
+Every push and pull request runs the tests on GitHub Actions (`.github/workflows/ci.yml`, Python 3.11
+like the Pi). The Pi pulls changes; GitHub never pushes to it (no inbound access, and no self-hosted runner, which is unsafe on a public repo):
+
+- `scripts/cron.sh` holds the whole schedule. `setup.sh` installs it, and every deploy reinstalls it, so schedule changes ship like code.
+- `scripts/deploy.sh` runs every 5 minutes. When `origin/main` has a new commit and CI passed for it,
+  it takes the deploy lock, fast-forwards, runs `pip install` if `requirements.txt` changed, runs the
+  checks on the Pi, and reinstalls cron. If a check fails it rolls back to the previous commit
+  (restoring the config too) and does not retry that commit. It refuses to deploy over local commits
+  or local changes, because the checkout should always equal `origin/main`.
+- Every scheduled job runs through `scripts/job.sh`, which holds a shared lock on `data/deploy.lock`.
+  A deploy only starts when no job holds it, and a job that starts during a deploy waits for it. So
+  code never changes under a running trading session or review.
+- `data/` is never touched beyond what the checks do (merging new config keys), so Claude's state
+  survives every deploy.
+
+Settings in `.env`: `NTFY_TOPIC` for deploy notifications, `DEPLOY_GITHUB_TOKEN` (a fine-grained
+read-only token with Checks access, needed for private repos), and `DEPLOY_CI_CHECK=skip` to deploy
+without waiting for CI. Logs: `data/deploy.log`, plus the output of the last checks in `data/deploy_checks.log`.
+
 
 ## Nightly review loop
 

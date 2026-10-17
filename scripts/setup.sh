@@ -112,20 +112,13 @@ step "Tests"
 step "Alpaca connection check"
 .venv/bin/python broker.py
 
-step "Cron jobs (trader 09:00, review 17:00, weekdays)"
+step "Cron jobs (trader 09:00, review 17:00 weekdays; deploy check every 5 minutes)"
 mkdir -p data
-cron_lines="0 9 * * 1-5 $REPO/scripts/run_trader.sh >> $REPO/data/cron.log 2>&1 $CRON_TAG
-0 17 * * 1-5 . $SECRETS; $REPO/review/run_review.sh $CRON_TAG"
-existing=$(crontab -l 2>/dev/null || true)
-if grep -qF "$CRON_TAG" <<<"$existing" && ! ask "Cron jobs already installed. Replace them?"; then
-  echo "Left existing cron jobs unchanged"
-else
-  { grep -vF "$CRON_TAG" <<<"$existing" || true; echo "$cron_lines"; } | crontab -
-  echo "OK: installed"
-fi
+scripts/cron.sh install
 crontab -l | grep -F "$CRON_TAG"
 
 step "Done"
 echo "The trader runs weekdays at 09:00 and the review at 17:00 (local time)."
+echo "New commits on origin/main deploy themselves once CI passes (log: data/deploy.log)."
 echo "Logs: data/trader.log, data/cron.log, data/reports/review_<date>.log"
 echo "If the Windows scheduled tasks exist, delete them so only one machine trades."
