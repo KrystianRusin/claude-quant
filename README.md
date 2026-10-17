@@ -256,12 +256,37 @@ the contract; the registry then refuses strategies written for the old one inste
 
 ## Swapping the broker
 
-`broker.py` defines a `Broker` interface (`get_account`, `get_bars`, `submit_bracket_order`,
-`list_positions`, `close_all`, `is_market_open` and a few order helpers) and the Alpaca backend.
-To add another backend, such as Interactive Brokers paper or a simulator fed by free delayed data,
-implement `Broker`, add it to `BACKENDS` in `broker.py`, and set `BROKER_BACKEND=<name>` in `.env`.
-`simbroker.SimBroker` already implements the interface on top of any bar source and is what
-`--dry-run` and `--replay` use, so it is a starting point for a fully local backend.
+`broker.py` defines the broker-neutral interface and nothing Alpaca-specific. A backend fills one
+or both roles:
+
+- `MarketData`: calendar, 1-minute and daily bars, asset flags, the equity universe.
+- `ExecutionBroker`: account, bracket and market orders, cancels, positions, `close_all`, and
+  `is_paper()`. It declares `capabilities` (today only `native_brackets`).
+
+`trader.py` gets one `Broker` that combines the two, so orders can go to one broker while bars come
+from another. Backends translate their order statuses into the neutral ones in `broker.py` (`new`,
+`held`, `partially_filled`, `pending_cancel`, `filled`, `canceled`, `rejected`, `expired`) and their
+errors into `BrokerError` subclasses (`DuplicateOrderError`, `OrderRejectedError`, `LiveAccountError`).
+Only the backend modules import a broker SDK.
+
+| `.env` setting | Default | Meaning |
+|---|---|---|
+| `BROKER_BACKEND` | `alpaca` | where orders go: `alpaca` (paper only) or `ibkr` (a stub, see below) |
+| `DATA_BACKEND` | `alpaca` | where bars and the calendar come from |
+| `ALLOW_LIVE` | unset | must be exactly `1` before an execution backend on a live account may run |
+
+- `alpaca_backend.py` is the Alpaca backend for both roles. It always uses the paper endpoint.
+- `ibkr_backend.py` is an Interactive Brokers stub. It can be selected and reports paper or live
+  (`IBKR_ACCOUNT` starting `DU`, or ports 4002/7497), so the live gate already applies, but every
+  account and order call raises `NotImplementedError`. Its docstring lists what the real backend
+  needs (IB Gateway on the Pi, `orderRef` as the client order id, native brackets, a status map).
+- The trader refuses a backend without native brackets. It relies on the broker canceling the other
+  exit leg when one fills, and emulating that by polling could leave both legs filled.
+
+To add a backend, implement the role classes, register it in `EXECUTION_BACKENDS` or
+`DATA_BACKENDS` in `broker.py`, and add a harness to `tests/test_broker_contract.py`. That suite is
+the contract the trader relies on (fills, duplicate ids, quiet second cancels, OCO legs, `close_all`),
+and SimBroker and Alpaca (on a fake client) both pass it. A backend must pass it before it trades.
 Strategies and `risk.py` do not change.
 
 ## Open decisions

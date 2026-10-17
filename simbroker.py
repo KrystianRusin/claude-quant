@@ -13,7 +13,8 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from broker import ET, Account, Broker, DuplicateOrderError, Order, Position
+from broker import (CANCELED, ET, FILLED, HELD, NEW, REJECTED, Account, Broker, Capabilities, DuplicateOrderError,
+                    Order, Position)
 
 BAR = timedelta(minutes=1)
 
@@ -66,6 +67,9 @@ class ReplaySource:
     def trading_days(self, end, count):
         return self.broker.trading_days(end, count)
 
+    def daily_bars(self, symbol, start, end):
+        return self.broker.daily_bars(symbol, start, end)
+
     def asset_flags(self, symbol):
         return True, True
 
@@ -94,6 +98,8 @@ class _SimOrder:
 
 
 class SimBroker(Broker):
+    capabilities = Capabilities(native_brackets=True)
+
     def __init__(self, source, clock, starting_equity=100_000.0):
         self.source = source
         self.clock = clock
@@ -115,6 +121,9 @@ class SimBroker(Broker):
     def trading_days(self, end, count):
         return self.source.trading_days(end, count)
 
+    def daily_bars(self, symbol, start, end):
+        return self.source.daily_bars(symbol, start, end)
+
     def asset_flags(self, symbol):
         return self.source.asset_flags(symbol)
 
@@ -130,6 +139,9 @@ class SimBroker(Broker):
 
     # account
 
+    def is_paper(self):
+        return True
+
     def get_account(self):
         self._sync()
         equity = self.cash + sum(q * self.marks.get(s, avg) for s, (q, avg) in self.positions.items())
@@ -142,7 +154,7 @@ class SimBroker(Broker):
 
     # orders
 
-    def _new(self, symbol, side, qty, order_type, cid, status="new", limit=None, stop=None):
+    def _new(self, symbol, side, qty, order_type, cid, status=NEW, limit=None, stop=None):
         return _SimOrder(f"sim-{next(self._ids)}", cid, symbol, side, float(qty), order_type, status,
                          self.clock.now(), limit_price=limit, stop_price=stop)
 
@@ -158,22 +170,22 @@ class SimBroker(Broker):
         parent = self._new(symbol, "buy" if buy else "sell", qty, "market", client_order_id)
         exit_side = "sell" if buy else "buy"
         parent.legs = [
-            self._new(symbol, exit_side, qty, "limit", f"{client_order_id}-tp", "held", limit=take_profit),
-            self._new(symbol, exit_side, qty, "stop", f"{client_order_id}-sl", "held", stop=stop_price),
+            self._new(symbol, exit_side, qty, "limit", f"{client_order_id}-tp", HELD, limit=take_profit),
+            self._new(symbol, exit_side, qty, "stop", f"{client_order_id}-sl", HELD, stop=stop_price),
         ]
         mark = self.marks.get(symbol)
         wrong_side = mark is not None and ((stop_price >= mark or take_profit <= mark) if buy
                                            else (stop_price <= mark or take_profit >= mark))
         if qty <= 0 or wrong_side:
-            parent.status = "rejected"
+            parent.status = REJECTED
             for leg in parent.legs:
-                leg.status = "canceled"
+                leg.status = CANCELED
         return self._register(parent)
 
     def submit_market_order(self, symbol, side, qty, client_order_id):
         order = self._new(symbol, side, qty, "market", client_order_id)
         if qty <= 0:
-            order.status = "rejected"
+            order.status = REJECTED
         return self._register(order)
 
     def _find(self, order_id):
@@ -199,18 +211,19 @@ class SimBroker(Broker):
         return [o.snapshot() for o in self.orders if o.created_at >= after]
 
     def cancel_order(self, order_id):
+        self._sync()  # fills on bars completed before the cancel come first, as at a real broker
         order, parent = self._find(order_id)
         siblings = parent.legs if parent else [order, *order.legs]
         for o in siblings:
-            if o.status in ("new", "held", "accepted"):
-                o.status = "canceled"
+            if o.status in (NEW, HELD):
+                o.status = CANCELED
 
     def close_all(self):
         self._sync()
         for o in self.orders:
             for x in (o, *o.legs):
-                if x.status in ("new", "held", "accepted"):
-                    x.status = "canceled"
+                if x.status in (NEW, HELD):
+                    x.status = CANCELED
         for symbol, (qty, _) in list(self.positions.items()):
             cid = f"close-all-{symbol}-{next(self._ids)}"
             self._register(self._new(symbol, "sell" if qty > 0 else "buy", abs(qty), "market", cid))
@@ -218,7 +231,7 @@ class SimBroker(Broker):
     # fill engine
 
     def _fill(self, order, price, when):
-        order.status, order.filled_qty, order.filled_avg_price, order.filled_at = "filled", order.qty, price, when
+        order.status, order.filled_qty, order.filled_avg_price, order.filled_at = FILLED, order.qty, price, when
         signed = order.qty if order.side == "buy" else -order.qty
         self.cash -= signed * price
         qty, avg = self.positions.get(order.symbol, [0.0, 0.0])
@@ -234,7 +247,7 @@ class SimBroker(Broker):
 
     def _check_legs(self, parent, ts, bar):
         tp, sl = parent.legs
-        if sl.status != "new":
+        if sl.status != NEW:
             return
         long_ = parent.side == "buy"
         o, h, lo = float(bar["open"]), float(bar["high"]), float(bar["low"])
@@ -255,7 +268,7 @@ class SimBroker(Broker):
         else:
             return
         self._fill(leg, price, max(ts, parent.filled_at))
-        (sl if leg is tp else tp).status = "canceled"
+        (sl if leg is tp else tp).status = CANCELED
 
     def _sync(self):
         """Process every completed bar since the last sync for symbols with orders or positions."""
@@ -264,7 +277,7 @@ class SimBroker(Broker):
             return
         self._synced_at = now
         active = [o for o in self.orders
-                  if o.status == "new" or any(leg.status in ("new", "held") for leg in o.legs)]
+                  if o.status == NEW or any(leg.status in (NEW, HELD) for leg in o.legs)]
         symbols = {o.symbol for o in active} | set(self.positions)
         if not symbols:
             return
@@ -278,12 +291,12 @@ class SimBroker(Broker):
             last = self.last_bar.get(symbol)
             for ts, bar in (frame[frame.index > last] if last is not None else frame).iterrows():
                 for order in [o for o in self.orders if o.symbol == symbol]:
-                    if order.status == "new" and floor(order.created_at) <= ts:
+                    if order.status == NEW and floor(order.created_at) <= ts:
                         self._fill(order, float(bar["open"]), max(ts, order.created_at))
                         for leg in order.legs:
-                            if leg.status == "held":
-                                leg.status = "new"
-                    if order.legs and order.status == "filled":
+                            if leg.status == HELD:
+                                leg.status = NEW
+                    if order.legs and order.status == FILLED:
                         self._check_legs(order, ts, bar)
                 self.marks[symbol] = float(bar["close"])
                 self.last_bar[symbol] = ts

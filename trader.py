@@ -16,7 +16,8 @@ from pathlib import Path
 
 import risk
 import strategies
-from broker import ET, DuplicateOrderError, make_broker
+from broker import (ET, FILLED, FINAL_STATUSES, PARTIALLY_FILLED, BrokerError, DuplicateOrderError, make_broker,
+                    make_execution, make_market_data)
 from config import CONFIG_PATH, ConfigError, ensure_state, load_config, parse_hhmm
 from logger import TradeLog, setup_logging, trade_row
 from simbroker import RealClock, ReplaySource, SimBroker, SimClock, completed
@@ -28,7 +29,7 @@ POLL_SECONDS = 30
 REPLAY_POLL_SECONDS = 60
 MAX_CONSECUTIVE_ERRORS = 10
 EXIT_WAIT_SECONDS = 180
-FINAL_STATUSES = {"filled", "partially_filled", "canceled", "rejected", "expired"}
+LOGGED_STATUSES = FINAL_STATUSES | {PARTIALLY_FILLED}  # order states written to orders.csv
 
 
 @dataclass
@@ -80,6 +81,10 @@ class Session:
                  poll_seconds=POLL_SECONDS, halt_path=HALT_PATH):
         self.cfg = cfg
         self.strategy = strategies.load(cfg["strategy"]["name"])
+        if not broker.capabilities.native_brackets:
+            # Entries rely on the broker canceling the other exit leg when one fills; emulating that
+            # by polling could leave both legs filled, so a backend without brackets is refused.
+            raise BrokerError(f"{type(broker).__name__} has no native bracket orders, which the trader needs")
         self.broker = broker
         self.clock = clock
         self.log = log
@@ -127,7 +132,7 @@ class Session:
 
     def _track(self, order):
         for o in (order, *order.legs):
-            if o.status in FINAL_STATUSES and self.statuses.get(o.id) != o.status:
+            if o.status in LOGGED_STATUSES and self.statuses.get(o.id) != o.status:
                 self.statuses[o.id] = o.status
                 self.event(o.status, o.symbol, side=o.side, qty=o.filled_qty or o.qty,
                            order_type=o.order_type, price=o.filled_avg_price or "",
@@ -141,7 +146,7 @@ class Session:
         rows = self.log.order_rows(self.day)
         submits = {r["client_order_id"]: r for r in rows if r["event"] == "submit" and r["client_order_id"]}
         for r in rows:
-            if r["order_id"] and r["status"] in FINAL_STATUSES:
+            if r["order_id"] and r["status"] in LOGGED_STATUSES:
                 self.statuses[r["order_id"]] = r["status"]
             if r["event"] == "skip":
                 self.entered.add(r["symbol"])
@@ -228,23 +233,23 @@ class Session:
                 order = self.broker.get_order(t.entry_order_id)
                 self._track(order)
                 if t.status == "pending":
-                    if order.status == "filled" or (order.filled_qty > 0 and not order.is_open):
+                    if order.status == FILLED or (order.filled_qty > 0 and not order.is_open):
                         t.status, t.qty = "open", order.filled_qty
                         t.entry_price, t.entry_time = order.filled_avg_price, order.filled_at
-                        if order.status != "filled":
+                        if order.status != FILLED:
                             self.logger.warning("%s entry only partly filled (%s)", t.symbol, t.qty)
                     elif not order.is_open:
                         t.status = "void"
                 if t.status == "open":
                     for leg in order.legs:
-                        if leg.status == "filled":
+                        if leg.status == FILLED:
                             self._close(t, leg.filled_avg_price, leg.filled_at,
                                         "tp" if leg.order_type == "limit" else "sl")
                             break
             if t.status == "open" and t.exit_order_id:
                 x = self.broker.get_order(t.exit_order_id)
                 self._track(x)
-                if x.status == "filled":
+                if x.status == FILLED:
                     if t.carryover:
                         t.entry_price = t.entry_price if t.entry_price is not None else x.filled_avg_price
                     self._close(t, x.filled_avg_price, x.filled_at, t.exit_reason)
@@ -274,7 +279,7 @@ class Session:
                 if not any(leg.is_open for leg in order.legs):
                     break
                 self.clock.sleep(1)
-            if any(leg.status == "filled" for leg in order.legs):
+            if any(leg.status == FILLED for leg in order.legs):
                 return
         self._submit_exit(t, reason, f"{t.entry_cid}-x")
 
@@ -496,7 +501,7 @@ def run_replay(args):
     logger = setup_logging(data_dir)
     log = TradeLog(data_dir, "replay")
     log.clear()
-    real = make_broker(cfg["data_feed"])
+    real = make_market_data(cfg["data_feed"])
     if args.replay:
         days = [datetime.strptime(d, "%Y-%m-%d").date() for d in args.replay]
     else:
@@ -527,7 +532,7 @@ def run_replay(args):
 
 
 def run_flatten(args):
-    broker = make_broker()
+    broker = make_execution()
     positions = broker.list_positions()
     broker.close_all()
     print(f"canceled open orders and closed positions: {sorted(positions) or 'none'}")

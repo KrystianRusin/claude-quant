@@ -1,11 +1,19 @@
-"""Broker interface plus the Alpaca paper backend. Paper trading only.
+"""Broker interface: broker-neutral types, the two backend roles, and the backend registry.
 
 Run `python broker.py` to check credentials, the account, the calendar and bar data.
 
-Other backends (another broker's paper API, or a simulator fed by free data)
-implement `Broker` and return the plain types below. trader.py, risk.py and the
-strategies only ever see this interface.
+A backend fills one or both roles:
+- `MarketData`: calendar, bars and asset flags (Alpaca's free IEX data today).
+- `ExecutionBroker`: account, orders and positions.
+trader.py sees one `Broker` that combines the two, so orders can go to one broker while data comes
+from another. `BROKER_BACKEND` picks the execution backend and `DATA_BACKEND` the data backend
+(both default to "alpaca"). Backends translate their own order statuses and errors into the ones
+below; nothing outside a backend module imports a broker SDK.
+
+Live accounts: every execution backend reports `is_paper()`. A backend connected to a live account
+is refused unless ALLOW_LIVE=1 is set in the environment or .env.
 """
+import importlib
 import os
 import sys
 from abc import ABC, abstractmethod
@@ -13,21 +21,44 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-import pandas as pd
 from dotenv import load_dotenv
 
 ET = ZoneInfo("America/New_York")
 BAR_COLUMNS = ["open", "high", "low", "close", "volume", "vwap"]
-OPEN_STATUSES = {"new", "accepted", "pending_new", "partially_filled", "held",
-                 "accepted_for_bidding", "pending_cancel", "pending_replace", "done_for_day"}
+
+# Order statuses. Backends map theirs onto these.
+NEW = "new"  # working at the broker
+HELD = "held"  # a bracket leg waiting for its entry to fill
+PARTIALLY_FILLED = "partially_filled"
+PENDING_CANCEL = "pending_cancel"
+FILLED = "filled"
+CANCELED = "canceled"
+REJECTED = "rejected"
+EXPIRED = "expired"
+OPEN_STATUSES = frozenset({NEW, HELD, PARTIALLY_FILLED, PENDING_CANCEL})
+FINAL_STATUSES = frozenset({FILLED, CANCELED, REJECTED, EXPIRED})
+STATUSES = OPEN_STATUSES | FINAL_STATUSES
 
 
-class LiveEndpointError(RuntimeError):
-    pass
+class BrokerError(RuntimeError):
+    """A broker refused or failed a request."""
 
 
-class DuplicateOrderError(RuntimeError):
+class DuplicateOrderError(BrokerError):
     """An order with this client_order_id already exists."""
+
+
+class OrderRejectedError(BrokerError):
+    """The broker rejected the order (buying power, invalid prices, symbol not tradable, ...)."""
+
+
+class LiveAccountError(BrokerError):
+    """The backend is connected to a live account and ALLOW_LIVE=1 is not set."""
+
+
+@dataclass(frozen=True)
+class Capabilities:
+    native_brackets: bool  # entry + stop + take-profit as one order whose exit legs cancel each other
 
 
 @dataclass(frozen=True)
@@ -53,7 +84,7 @@ class Order:
     side: str  # "buy" or "sell"
     qty: float
     order_type: str  # "market", "limit" or "stop"
-    status: str
+    status: str  # one of STATUSES
     filled_qty: float = 0.0
     filled_avg_price: float | None = None
     filled_at: datetime | None = None
@@ -67,11 +98,8 @@ class Order:
         return self.status in OPEN_STATUSES
 
 
-class Broker(ABC):
-    """What trader.py needs from a broker backend. All datetimes are ET-aware."""
-
-    @abstractmethod
-    def get_account(self) -> Account: ...
+class MarketData(ABC):
+    """Calendar and price data. All datetimes are ET-aware."""
 
     @abstractmethod
     def is_market_open(self) -> bool: ...
@@ -89,30 +117,65 @@ class Broker(ABC):
         """{symbol: DataFrame of 1-minute bars indexed by ET bar start}."""
 
     @abstractmethod
+    def daily_bars(self, symbol, start, end):
+        """Daily bar frame for one symbol, or None."""
+
+    @abstractmethod
     def asset_flags(self, symbol):
         """(shortable, easy_to_borrow)."""
 
+    def daily_bars_many(self, symbols, start, end):
+        """{symbol: daily bar frame}; backends with a batch endpoint override this."""
+        frames = {s: self.daily_bars(s, start, end) for s in symbols}
+        return {s: f for s, f in frames.items() if f is not None}
+
+    def list_equities(self):
+        """Active, tradable US equities and ETFs as dicts (symbol, name, exchange, shortable, easy_to_borrow)."""
+        raise NotImplementedError(f"{type(self).__name__} cannot list the equity universe")
+
+
+class ExecutionBroker(ABC):
+    """Account, orders and positions. Statuses are the ones above; errors are BrokerError subclasses."""
+
+    capabilities = Capabilities(native_brackets=False)
+
+    @abstractmethod
+    def is_paper(self) -> bool:
+        """True when connected to a paper (simulated) account."""
+
+    @abstractmethod
+    def get_account(self) -> Account: ...
+
     @abstractmethod
     def submit_bracket_order(self, symbol, side, qty, stop_price, take_profit, client_order_id) -> Order:
-        """Market entry with stop and take-profit legs; side is "long" or "short"."""
+        """Market entry with stop and take-profit legs; side is "long" or "short".
+
+        Only for backends with `capabilities.native_brackets`. The legs come back in `Order.legs` (a
+        "limit" take-profit and a "stop"), and filling or canceling one cancels the other.
+        Raises DuplicateOrderError if the client_order_id was used before."""
 
     @abstractmethod
     def submit_market_order(self, symbol, side, qty, client_order_id) -> Order:
-        """Plain market order; side is "buy" or "sell"."""
+        """Plain DAY market order; side is "buy" or "sell". Raises DuplicateOrderError on a reused id."""
 
     @abstractmethod
-    def get_order(self, order_id) -> Order: ...
+    def get_order(self, order_id) -> Order:
+        """The order with its legs."""
 
     @abstractmethod
-    def get_order_by_client_id(self, client_order_id) -> Order | None: ...
+    def get_order_by_client_id(self, client_order_id) -> Order | None:
+        """The order with its legs, or None if no order has this id."""
 
     @abstractmethod
     def list_orders(self, after) -> list:
-        """All orders created after `after`, any status, with legs."""
+        """All top-level orders created after `after`, any status, with legs."""
 
     @abstractmethod
     def cancel_order(self, order_id):
-        """Request a cancel. Returns quietly if the order is already closed or being canceled."""
+        """Request a cancel. Returns quietly if the order is already closed or being canceled.
+
+        Canceling one bracket leg may cancel its sibling (an OCO pair), and a cancel can race a fill,
+        so a second cancel failing that way is expected. Other failures raise BrokerError."""
 
     @abstractmethod
     def list_positions(self) -> dict:
@@ -123,18 +186,73 @@ class Broker(ABC):
         """Cancel every open order and close every position at market."""
 
 
-def assert_paper_url(url):
-    if "paper-api" not in str(url):
-        raise LiveEndpointError(f"refusing to run: trading endpoint is not a paper endpoint ({url})")
+class Broker(ExecutionBroker, MarketData):
+    """Everything trader.py needs: one execution role and one data role."""
 
 
-def load_credentials():
-    load_dotenv()
-    key = os.environ.get("ALPACA_API_KEY")
-    secret = os.environ.get("ALPACA_SECRET_KEY")
-    if not key or not secret:
-        raise RuntimeError("ALPACA_API_KEY and ALPACA_SECRET_KEY must be set in the environment or .env")
-    return key, secret
+class CombinedBroker(Broker):
+    """A Broker made of an execution backend and a separate data backend."""
+
+    def __init__(self, execution, data):
+        self.execution = execution
+        self.data = data
+        self.capabilities = execution.capabilities
+
+    # data
+    def is_market_open(self):
+        return self.data.is_market_open()
+
+    def session(self, day):
+        return self.data.session(day)
+
+    def trading_days(self, end, count):
+        return self.data.trading_days(end, count)
+
+    def get_bars(self, symbols, start, end):
+        return self.data.get_bars(symbols, start, end)
+
+    def daily_bars(self, symbol, start, end):
+        return self.data.daily_bars(symbol, start, end)
+
+    def daily_bars_many(self, symbols, start, end):
+        return self.data.daily_bars_many(symbols, start, end)
+
+    def asset_flags(self, symbol):
+        return self.data.asset_flags(symbol)
+
+    def list_equities(self):
+        return self.data.list_equities()
+
+    # execution
+    def is_paper(self):
+        return self.execution.is_paper()
+
+    def get_account(self):
+        return self.execution.get_account()
+
+    def submit_bracket_order(self, symbol, side, qty, stop_price, take_profit, client_order_id):
+        return self.execution.submit_bracket_order(symbol, side, qty, stop_price, take_profit, client_order_id)
+
+    def submit_market_order(self, symbol, side, qty, client_order_id):
+        return self.execution.submit_market_order(symbol, side, qty, client_order_id)
+
+    def get_order(self, order_id):
+        return self.execution.get_order(order_id)
+
+    def get_order_by_client_id(self, client_order_id):
+        return self.execution.get_order_by_client_id(client_order_id)
+
+    def list_orders(self, after):
+        return self.execution.list_orders(after)
+
+    def cancel_order(self, order_id):
+        return self.execution.cancel_order(order_id)
+
+    def list_positions(self):
+        return self.execution.list_positions()
+
+    def close_all(self):
+        return self.execution.close_all()
 
 
 def to_et(ts):
@@ -146,215 +264,53 @@ def to_et(ts):
     return ts.astimezone(ET)
 
 
-def bars_to_frames(df):
-    """Split alpaca's (symbol, timestamp) bar frame into {symbol: frame indexed by ET bar start}."""
-    out = {}
-    if df is None or df.empty:
-        return out
-    for symbol, g in df.groupby(level=0):
-        g = g.droplevel(0)
-        g.index = pd.DatetimeIndex(g.index).tz_convert(ET)
-        out[symbol] = g[[c for c in BAR_COLUMNS if c in g.columns]].sort_index()
-    return out
+# Backends are "module:Class" so that importing broker never imports a broker SDK.
+EXECUTION_BACKENDS = {"alpaca": "alpaca_backend:AlpacaExecution", "ibkr": "ibkr_backend:IBKRExecution"}
+DATA_BACKENDS = {"alpaca": "alpaca_backend:AlpacaMarketData"}
 
 
-def _float(v):
-    return None if v is None else float(v)
+def _backend(registry, variable):
+    name = os.environ.get(variable, "alpaca")
+    if name not in registry:
+        raise RuntimeError(f"unknown {variable} {name!r}; available: {sorted(registry)}")
+    target = registry[name]
+    if isinstance(target, str):
+        module, _, cls = target.partition(":")
+        target = getattr(importlib.import_module(module), cls)
+    return target
 
 
-def _value(v):
-    return getattr(v, "value", v)
+def check_live(execution):
+    """Refuse a live account unless ALLOW_LIVE=1."""
+    if not execution.is_paper() and os.environ.get("ALLOW_LIVE") != "1":
+        raise LiveAccountError(f"refusing to run: {type(execution).__name__} is connected to a live account "
+                               "and ALLOW_LIVE=1 is not set")
+    return execution
 
 
-def order_from_alpaca(o):
-    return Order(
-        id=str(o.id), client_order_id=o.client_order_id, symbol=o.symbol,
-        side=_value(o.side), qty=float(o.qty or 0), order_type=_value(o.order_type or o.type),
-        status=_value(o.status), filled_qty=float(o.filled_qty or 0),
-        filled_avg_price=_float(o.filled_avg_price), filled_at=to_et(o.filled_at),
-        created_at=to_et(o.created_at), limit_price=_float(o.limit_price),
-        stop_price=_float(o.stop_price),
-        legs=tuple(order_from_alpaca(leg) for leg in (o.legs or [])),
-    )
+def make_execution():
+    """The execution backend named by BROKER_BACKEND, after the live-account check."""
+    load_dotenv()
+    return check_live(_backend(EXECUTION_BACKENDS, "BROKER_BACKEND")())
 
 
-class AlpacaBroker(Broker):
-    def __init__(self, feed="iex"):
-        from alpaca.data.historical import StockHistoricalDataClient
-        from alpaca.trading.client import TradingClient
-
-        key, secret = load_credentials()
-        self.trading = TradingClient(key, secret, paper=True)
-        assert_paper_url(self.base_url)
-        self.data = StockHistoricalDataClient(key, secret)
-        self.feed = feed
-
-    @property
-    def base_url(self):
-        url = self.trading._base_url
-        return str(getattr(url, "value", url))
-
-    def get_account(self):
-        assert_paper_url(self.base_url)
-        a = self.trading.get_account()
-        if a.trading_blocked or a.account_blocked:
-            raise RuntimeError("paper account is blocked from trading")
-        return Account(equity=float(a.equity), last_equity=float(a.last_equity),
-                       buying_power=float(a.buying_power), shorting_enabled=bool(a.shorting_enabled))
-
-    def is_market_open(self):
-        return bool(self.trading.get_clock().is_open)
-
-    def session(self, day):
-        from alpaca.trading.requests import GetCalendarRequest
-
-        days = [d for d in self.trading.get_calendar(GetCalendarRequest(start=day, end=day)) if d.date == day]
-        if not days:
-            return None
-        return to_et(days[0].open), to_et(days[0].close)
-
-    def trading_days(self, end, count):
-        from alpaca.trading.requests import GetCalendarRequest
-
-        days = self.trading.get_calendar(GetCalendarRequest(start=end - timedelta(days=count * 2 + 10), end=end))
-        return [d.date for d in days][-count:]
-
-    def get_bars(self, symbols, start, end):
-        from alpaca.data.enums import DataFeed
-        from alpaca.data.requests import StockBarsRequest
-        from alpaca.data.timeframe import TimeFrame
-
-        req = StockBarsRequest(symbol_or_symbols=list(symbols), timeframe=TimeFrame.Minute,
-                               start=start, end=end, feed=DataFeed(self.feed))
-        return bars_to_frames(self.data.get_stock_bars(req).df)
-
-    def daily_bars(self, symbol, start, end):
-        from alpaca.data.enums import DataFeed
-        from alpaca.data.requests import StockBarsRequest
-        from alpaca.data.timeframe import TimeFrame
-
-        req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame.Day,
-                               start=start, end=end, feed=DataFeed(self.feed))
-        return bars_to_frames(self.data.get_stock_bars(req).df).get(symbol)
-
-    def asset_flags(self, symbol):
-        asset = self.trading.get_asset(symbol)
-        return asset.shortable, asset.easy_to_borrow
-
-    def list_equities(self):
-        """Active, tradable US equities and ETFs as dicts."""
-        from alpaca.trading.enums import AssetClass, AssetStatus
-        from alpaca.trading.requests import GetAssetsRequest
-
-        assets = self.trading.get_all_assets(GetAssetsRequest(status=AssetStatus.ACTIVE,
-                                                              asset_class=AssetClass.US_EQUITY))
-        return [{"symbol": a.symbol, "name": a.name or "", "exchange": _value(a.exchange),
-                 "shortable": bool(a.shortable), "easy_to_borrow": bool(a.easy_to_borrow)}
-                for a in assets if a.tradable]
-
-    def daily_bars_many(self, symbols, start, end, batch=1000):
-        """{symbol: daily bar frame} for many symbols, fetched in batches."""
-        from alpaca.data.enums import DataFeed
-        from alpaca.data.requests import StockBarsRequest
-        from alpaca.data.timeframe import TimeFrame
-
-        out = {}
-        symbols = list(symbols)
-        for i in range(0, len(symbols), batch):
-            req = StockBarsRequest(symbol_or_symbols=symbols[i:i + batch], timeframe=TimeFrame.Day,
-                                   start=start, end=end, feed=DataFeed(self.feed))
-            out.update(bars_to_frames(self.data.get_stock_bars(req).df))
-        return out
-
-    def _submit(self, req):
-        from alpaca.common.exceptions import APIError
-
-        try:
-            return order_from_alpaca(self.trading.submit_order(req))
-        except APIError as e:
-            if "client_order_id must be unique" in str(e):
-                raise DuplicateOrderError(req.client_order_id) from e
-            raise
-
-    def submit_bracket_order(self, symbol, side, qty, stop_price, take_profit, client_order_id):
-        from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
-        from alpaca.trading.requests import MarketOrderRequest, StopLossRequest, TakeProfitRequest
-
-        return self._submit(MarketOrderRequest(
-            symbol=symbol, qty=qty,
-            side=OrderSide.BUY if side == "long" else OrderSide.SELL,
-            time_in_force=TimeInForce.DAY, order_class=OrderClass.BRACKET,
-            client_order_id=client_order_id,
-            take_profit=TakeProfitRequest(limit_price=take_profit),
-            stop_loss=StopLossRequest(stop_price=stop_price),
-        ))
-
-    def submit_market_order(self, symbol, side, qty, client_order_id):
-        from alpaca.trading.enums import OrderSide, TimeInForce
-        from alpaca.trading.requests import MarketOrderRequest
-
-        return self._submit(MarketOrderRequest(symbol=symbol, qty=qty, side=OrderSide(side),
-                                               time_in_force=TimeInForce.DAY,
-                                               client_order_id=client_order_id))
-
-    def get_order(self, order_id):
-        from alpaca.trading.requests import GetOrderByIdRequest
-
-        return order_from_alpaca(self.trading.get_order_by_id(order_id, filter=GetOrderByIdRequest(nested=True)))
-
-    def get_order_by_client_id(self, client_order_id):
-        from alpaca.common.exceptions import APIError
-
-        try:
-            o = self.trading.get_order_by_client_id(client_order_id)
-        except APIError:
-            return None
-        return self.get_order(o.id)
-
-    def list_orders(self, after):
-        from alpaca.trading.enums import QueryOrderStatus
-        from alpaca.trading.requests import GetOrdersRequest
-
-        orders = self.trading.get_orders(GetOrdersRequest(status=QueryOrderStatus.ALL, after=after,
-                                                          nested=True, limit=500))
-        return [order_from_alpaca(o) for o in orders]
-
-    def cancel_order(self, order_id):
-        from alpaca.common.exceptions import APIError
-
-        try:
-            self.trading.cancel_order_by_id(order_id)
-        except APIError as e:
-            # 422: already pending cancel, canceled or filled. Cancelling one bracket leg
-            # cancels its OCO sibling, so this is the normal result for the second leg.
-            if e.status_code != 422:
-                raise
-
-    def list_positions(self):
-        return {p.symbol: Position(p.symbol, float(p.qty), float(p.avg_entry_price))
-                for p in self.trading.get_all_positions()}
-
-    def close_all(self):
-        self.trading.close_all_positions(cancel_orders=True)
-
-
-BACKENDS = {"alpaca": AlpacaBroker}
+def make_market_data(feed="iex"):
+    """The data backend named by DATA_BACKEND. Needs no trading access."""
+    load_dotenv()
+    return _backend(DATA_BACKENDS, "DATA_BACKEND")(feed=feed)
 
 
 def make_broker(feed="iex"):
-    """Build the backend named by BROKER_BACKEND (default "alpaca")."""
-    load_dotenv()
-    name = os.environ.get("BROKER_BACKEND", "alpaca")
-    if name not in BACKENDS:
-        raise RuntimeError(f"unknown BROKER_BACKEND {name!r}; available: {sorted(BACKENDS)}")
-    return BACKENDS[name](feed=feed)
+    return CombinedBroker(make_execution(), make_market_data(feed))
 
 
 def main():
     broker = make_broker()
     acct = broker.get_account()
-    print(f"paper account OK: equity={acct.equity} last_equity={acct.last_equity} "
-          f"buying_power={acct.buying_power} shorting_enabled={acct.shorting_enabled}")
+    print(f"{type(broker.execution).__name__} {'paper' if broker.is_paper() else 'LIVE'} account OK: "
+          f"equity={acct.equity} last_equity={acct.last_equity} buying_power={acct.buying_power} "
+          f"shorting_enabled={acct.shorting_enabled}")
+    print(f"data from {type(broker.data).__name__}; native brackets: {broker.capabilities.native_brackets}")
     print(f"market open now: {broker.is_market_open()}")
     now = datetime.now(ET)
     days = broker.trading_days(now.date(), 3)
@@ -373,6 +329,6 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (LiveEndpointError, RuntimeError) as e:
+    except RuntimeError as e:
         print(e)
         sys.exit(1)

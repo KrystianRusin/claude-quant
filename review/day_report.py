@@ -40,10 +40,10 @@ def log_lines(path, day, max_lines=MAX_LOG_LINES):
 def market_move(day):
     """SPY open-to-close move and intraday range in percent, or an explanation string."""
     try:
-        from broker import make_broker
+        from broker import make_market_data
 
         start = datetime.combine(day, datetime.min.time())
-        bars = make_broker().daily_bars("SPY", start, start + timedelta(days=1))
+        bars = make_market_data().daily_bars("SPY", start, start + timedelta(days=1))
         if bars is None or bars.empty:
             return "no SPY bar returned"
         b = bars.iloc[0]

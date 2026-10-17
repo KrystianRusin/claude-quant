@@ -70,10 +70,10 @@ def main(argv=None):
     ap.add_argument("--out", default=str(DEFAULT_OUT))
     args = ap.parse_args(argv)
 
-    from broker import ET, AlpacaBroker
+    from broker import ET, make_market_data
 
     criteria = load_json(BOUNDS_PATH)["universe"]
-    broker = AlpacaBroker(feed="sip")
+    broker = make_market_data(feed="sip")
     assets = eligible_assets(broker.list_equities(), criteria)
     end = datetime.now(ET) - timedelta(minutes=20)
     start = end - timedelta(days=criteria["lookback_days"] * 2 + 10)

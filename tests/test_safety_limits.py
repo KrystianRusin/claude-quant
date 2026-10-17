@@ -1,12 +1,14 @@
-"""Hard safety limits: paper-only endpoint, order cap, and the ceilings in config_bounds.json."""
+"""Hard safety limits: paper-only Alpaca, the live-account gate, order cap, and the ceilings in config_bounds.json."""
 import pytest
 
+import broker
 import risk
-from broker import AlpacaBroker, LiveEndpointError, assert_paper_url
+from alpaca_backend import AlpacaExecution, assert_paper_url
+from broker import LiveAccountError
 
 
-def test_live_endpoint_refused():
-    with pytest.raises(LiveEndpointError):
+def test_live_alpaca_endpoint_refused():
+    with pytest.raises(LiveAccountError):
         assert_paper_url("https://api.alpaca.markets")
     assert_paper_url("https://paper-api.alpaca.markets")
 
@@ -14,7 +16,37 @@ def test_live_endpoint_refused():
 def test_alpaca_client_is_paper(monkeypatch):
     monkeypatch.setenv("ALPACA_API_KEY", "test-key")
     monkeypatch.setenv("ALPACA_SECRET_KEY", "test-secret")
-    assert AlpacaBroker().base_url == "https://paper-api.alpaca.markets"
+    alpaca = AlpacaExecution()
+    assert alpaca.base_url == "https://paper-api.alpaca.markets" and alpaca.is_paper()
+
+
+class LiveBackend:
+    def is_paper(self):
+        return False
+
+
+def test_live_account_refused_without_allow_live(monkeypatch):
+    monkeypatch.delenv("ALLOW_LIVE", raising=False)
+    with pytest.raises(LiveAccountError):
+        broker.check_live(LiveBackend())
+    monkeypatch.setenv("ALLOW_LIVE", "yes")  # only exactly "1" counts
+    with pytest.raises(LiveAccountError):
+        broker.check_live(LiveBackend())
+
+
+def test_live_account_allowed_with_allow_live(monkeypatch):
+    monkeypatch.setenv("ALLOW_LIVE", "1")
+    backend = LiveBackend()
+    assert broker.check_live(backend) is backend
+
+
+def test_make_execution_applies_the_live_gate(monkeypatch):
+    monkeypatch.delenv("ALLOW_LIVE", raising=False)
+    monkeypatch.setattr(broker, "load_dotenv", lambda: None)  # ignore a local .env
+    monkeypatch.setitem(broker.EXECUTION_BACKENDS, "fake-live", LiveBackend)
+    monkeypatch.setenv("BROKER_BACKEND", "fake-live")
+    with pytest.raises(LiveAccountError):
+        broker.make_execution()
 
 
 def test_order_cap():

@@ -179,7 +179,7 @@ def test_replay_cli(tmp_path, monkeypatch, capsys):
     import trader
 
     source = FakeSource({"SPY": day_bars(TP_DAY)})
-    monkeypatch.setattr(trader, "make_broker", lambda feed="iex": source)
+    monkeypatch.setattr(trader, "make_market_data", lambda feed="iex": source)
     out = tmp_path / "replay"
     assert trader.main(["--replay", "2026-09-15", "2026-09-13", "--data-dir", str(out)]) == 0
     printed = capsys.readouterr().out
@@ -192,3 +192,13 @@ def test_replay_refuses_live_data_dir(monkeypatch):
 
     with pytest.raises(SystemExit):
         trader.main(["--replay", "2026-09-15", "--data-dir", str(trader.LIVE_DATA)])
+
+
+def test_backend_without_native_brackets_is_refused(tmp_path, cfg):
+    from broker import BrokerError, Capabilities
+
+    broker, _, _, make = setup(tmp_path, cfg, {"SPY": day_bars(TP_DAY)})
+    broker.capabilities = Capabilities(native_brackets=False)
+    with pytest.raises(BrokerError, match="bracket"):
+        make()
+    assert broker.orders == []

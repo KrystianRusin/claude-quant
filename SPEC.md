@@ -27,7 +27,8 @@ paper-trader/
   config_bounds.json      # hard limits the review loop may never exceed
   trader.py               # entry point, runs at market open
   strategy.py             # signal logic, pure functions, no I/O
-  broker.py               # thin Alpaca wrapper (data + orders)
+  broker.py               # broker-neutral interface and backend registry
+  alpaca_backend.py       # Alpaca data + paper orders
   risk.py                 # sizing and daily limits
   logger.py               # trade and event logging
   analyze.py              # analytics CLI
@@ -127,7 +128,7 @@ Nightly after close (about 17:00 ET), a headless Claude Code run reviews perform
 
 ## 9. Safety rules (non-negotiable)
 
-* `broker.py` constructs the client with `paper=True` and asserts the base URL contains `paper-api`. Any other value raises and exits.
+* `alpaca_backend.py` constructs the client with `paper=True` and asserts the base URL contains `paper-api`. Any other value raises and exits. Any execution backend on a live account is refused unless `ALLOW_LIVE=1` (`broker.check_live`).
 * Credentials come only from environment variables or `.env`. Never log or print keys.
 * Kill switch: if a file named `HALT` exists in the repo root, `trader.py` places no new orders and flattens positions.
 * Hard cap on orders per day (for example 20) as a runaway-bug guard.

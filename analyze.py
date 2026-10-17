@@ -322,10 +322,10 @@ def build_report(df, start_equity, baseline=None, title="Performance report", fi
 def spy_baseline(first, last):
     """SPY buy-and-hold return in percent from `first` open to `last` close, or an error string."""
     try:
-        from broker import make_broker
+        from broker import make_market_data
 
-        bars = make_broker().daily_bars("SPY", datetime.combine(first, datetime.min.time()),
-                                        datetime.combine(last + timedelta(days=1), datetime.min.time()))
+        bars = make_market_data().daily_bars("SPY", datetime.combine(first, datetime.min.time()),
+                                             datetime.combine(last + timedelta(days=1), datetime.min.time()))
         if bars is None or bars.empty:
             return "no SPY bars returned"
         return (float(bars["close"].iloc[-1]) / float(bars["open"].iloc[0]) - 1) * 100
