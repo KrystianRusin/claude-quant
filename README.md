@@ -176,7 +176,8 @@ like the Pi). The Pi pulls changes; GitHub never pushes to it (no inbound access
   or local changes, because the checkout should always equal `origin/main`.
 - Every scheduled job runs through `scripts/job.sh`, which holds a shared lock on `data/deploy.lock`.
   A deploy only starts when no job holds it, and a job that starts during a deploy waits for it. So
-  code never changes under a running trading session or review.
+  code never changes under a running trading session or review. `job.sh` also records each job in
+  the `runs` table of `data/trader.db` (see Database), and every deploy is recorded there too.
 - `data/` is never touched beyond what the checks do (merging new config keys), so Claude's state
   survives every deploy.
 
@@ -257,7 +258,7 @@ the contract; the registry then refuses strategies written for the old one inste
 ## Database
 
 Trades, order events and daily summaries are also written to SQLite, `data/trader.db` (the paper
-book; `data/dry_run/` and `data/replay/` have their own). It is the source for the dashboard
+book; `data/shadow/`, `data/dry_run/` and `data/replay/` have their own). It is the source for the dashboard
 (`claude-desk`), which opens it read-only next to the sentiment trader's database.
 
 - **Dual-write phase:** the CSV files are still the source of truth and every write is mirrored
@@ -270,14 +271,28 @@ book; `data/dry_run/` and `data/replay/` have their own). It is the source for t
   the copy if they roll back. A backup is written to `data/backups/` at 03:00 each night, and the
   newest 30 are kept.
 
+Facts the dashboard needs that no CSV holds (`002_dashboard.sql`, also shared with
+claude-sentiment-trading):
+
+| Table | Written by |
+|---|---|
+| `equity_snapshots`, `position_snapshots` | The live and shadow sessions, every minute and once more at the end (not replays) |
+| `orders` | The latest state of each order, whenever the session sees it change (`order_events` keeps the history) |
+| `runs` | `scripts/job.sh` for every cron job (`running`, `ok`, `failed`, or `lost` when it died without reporting back, with the end of its output as the error), and `deploy.sh` for every deploy. Paper database only |
+| `versions` | The config and shadow config, each strategy, the watchlist, `memory.md` and the review prompt, one row each time one changes: at session start, after a review the guard passed, and on deploy. `version` is what trades carry (`config_version`, `strategy_version`). Paper database only |
+
+`db.py import` rebuilds only the CSV tables and leaves these alone.
+
 ```bash
 .venv/bin/python db.py check            # CSV and database agree?
 .venv/bin/python db.py import           # rebuild the database rows from the CSVs
 .venv/bin/python db.py backup [DEST]
 .venv/bin/python db.py restore data/backups/trader-<time>.db
+.venv/bin/python db.py versions         # record the config, strategies, watchlist and memory if they changed
 ```
 
 The nightly review cannot change `trader.db`: the guard checks it like any other file in `data/`.
+The versions it changed are recorded after the guard has passed.
 
 ## Swapping the broker
 

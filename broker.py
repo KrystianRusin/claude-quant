@@ -74,6 +74,7 @@ class Position:
     symbol: str
     qty: float  # negative for shorts
     avg_entry_price: float
+    current_price: float | None = None
 
 
 @dataclass(frozen=True)

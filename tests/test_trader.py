@@ -212,3 +212,40 @@ def test_session_mirrors_every_write_into_the_database(tmp_path, cfg):
     conn = db.connect(tmp_path / db.DB_NAME)
     assert db.compare(conn, "replay", *db.csv_rows(tmp_path)) == []
     assert conn.execute("SELECT exit_reason FROM trades").fetchone()[0] == "tp"
+
+
+def test_dry_run_session_records_snapshots_and_order_states(tmp_path, cfg):
+    import db
+
+    clock = SimClock(OPEN - timedelta(minutes=5))
+    broker = SimBroker(FakeSource({"SPY": day_bars(TP_DAY)}), clock, 100_000)
+    log = TradeLog(tmp_path, "dry-run")
+    Session(cfg, broker, clock, log, LOGGER, OPEN, CLOSE, "dry-run", poll_seconds=30, halt_path=None).run()
+    conn = db.connect(tmp_path / db.DB_NAME)
+    snaps = conn.execute("SELECT * FROM equity_snapshots ORDER BY ts").fetchall()
+    times = [pd.Timestamp(s["ts"]) for s in snaps]
+    assert len(snaps) > 10 and all(b - a >= pd.Timedelta(seconds=60) for a, b in zip(times[:-2], times[1:-1]))
+    assert {s["book"] for s in snaps} == {"dry_run"}
+    held = conn.execute("SELECT * FROM position_snapshots WHERE symbol = 'SPY'").fetchall()
+    assert held and all(p["qty"] == 198 and p["avg_entry_price"] == 101 for p in held)
+    first = conn.execute("SELECT * FROM equity_snapshots WHERE ts = ?", (held[0]["ts"],)).fetchone()
+    assert first["long_value"] == held[0]["market_value"] and first["positions"] == 1
+    assert first["cash"] == pytest.approx(first["equity"] - first["long_value"])
+    last = snaps[-1]
+    assert last["positions"] == 0 and last["equity"] == float(log.trades()[0]["pnl_usd"]) + 100_000
+    orders = {o["order_type"]: o for o in conn.execute("SELECT * FROM orders")}
+    entry = orders["market"]
+    assert (entry["status"], entry["filled_qty"], entry["parent_order_id"]) == ("filled", 198, None)
+    assert orders["limit"]["status"] == "filled" and orders["stop"]["status"] == "canceled"
+    assert orders["limit"]["parent_order_id"] == orders["stop"]["parent_order_id"] == entry["order_id"]
+    assert all(o.status == orders[o.order_type]["status"] for top in broker.orders for o in (top, *top.legs))
+
+
+def test_replay_session_takes_no_snapshots(tmp_path, cfg):
+    import db
+
+    _, _, _, make = setup(tmp_path, cfg, {"SPY": day_bars(TP_DAY)})
+    make().run()
+    conn = db.connect(tmp_path / db.DB_NAME)
+    assert conn.execute("SELECT COUNT(*) FROM equity_snapshots").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 3

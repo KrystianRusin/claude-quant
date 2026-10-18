@@ -260,7 +260,7 @@ class AlpacaExecution(b.ExecutionBroker):
                 raise _translate(e) from e
 
     def list_positions(self):
-        return {p.symbol: b.Position(p.symbol, float(p.qty), float(p.avg_entry_price))
+        return {p.symbol: b.Position(p.symbol, float(p.qty), float(p.avg_entry_price), _float(p.current_price))
                 for p in self._call(self.trading.get_all_positions)}
 
     def close_all(self):

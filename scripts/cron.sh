@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # The cron schedule, in one place. setup.sh installs it once and deploy.sh reinstalls it after every
 # deploy, so schedule changes ship like code. Lines are tagged and replace only this repo's entries.
+# Jobs run through scripts/job.sh, which records them in the runs table under JOB_NAME.
 #
 #   scripts/cron.sh install    replace this repo's cron entries
 #   scripts/cron.sh print      show them
@@ -10,9 +11,9 @@ REPO="$PWD"
 SECRETS="$HOME/.config/paper-trader/env"
 CRON_TAG="# paper-trader"
 
-lines="0 9 * * 1-5 $REPO/scripts/job.sh $REPO/scripts/run_trader.sh >> $REPO/data/cron.log 2>&1 $CRON_TAG
-0 17 * * 1-5 . $SECRETS; $REPO/scripts/job.sh $REPO/review/run_review.sh $CRON_TAG
-0 3 * * * $REPO/scripts/job.sh $REPO/.venv/bin/python $REPO/db.py backup >> $REPO/data/cron.log 2>&1 $CRON_TAG
+lines="0 9 * * 1-5 JOB_NAME=trader $REPO/scripts/job.sh $REPO/scripts/run_trader.sh >> $REPO/data/cron.log 2>&1 $CRON_TAG
+0 17 * * 1-5 . $SECRETS; JOB_NAME=review $REPO/scripts/job.sh $REPO/review/run_review.sh $CRON_TAG
+0 3 * * * JOB_NAME=backup $REPO/scripts/job.sh $REPO/.venv/bin/python $REPO/db.py backup >> $REPO/data/cron.log 2>&1 $CRON_TAG
 */5 * * * * $REPO/scripts/deploy.sh >> $REPO/data/deploy.log 2>&1 $CRON_TAG"
 
 case "${1:-}" in

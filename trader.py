@@ -14,11 +14,12 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import db
 import risk
 import strategies
 from broker import (ET, FILLED, FINAL_STATUSES, PARTIALLY_FILLED, BrokerError, DuplicateOrderError, make_broker,
                     make_execution, make_market_data)
-from config import CONFIG_PATH, ConfigError, ensure_state, load_config, parse_hhmm
+from config import CONFIG_PATH, STATE_DIR, ConfigError, ensure_state, load_config, parse_hhmm
 from logger import TradeLog, setup_logging, trade_row
 from simbroker import RealClock, ReplaySource, SimBroker, SimClock, completed
 
@@ -29,6 +30,7 @@ POLL_SECONDS = 30
 REPLAY_POLL_SECONDS = 60
 MAX_CONSECUTIVE_ERRORS = 10
 EXIT_WAIT_SECONDS = 180
+SNAPSHOT_SECONDS = 60  # equity and positions into the database, live and dry-run sessions only
 LOGGED_STATUSES = FINAL_STATUSES | {PARTIALLY_FILLED}  # order states written to orders.csv
 
 
@@ -109,6 +111,7 @@ class Session:
         self.notes = []
         self.blocked_logged = set()
         self.equity_start = None
+        self.last_snapshot = None
 
     # helpers
 
@@ -131,6 +134,7 @@ class Session:
         self.log.order_event(self.clock.now(), event, symbol, **fields)
 
     def _track(self, order):
+        self.log.order_state(self.clock.now(), order)
         for o in (order, *order.legs):
             if o.status in LOGGED_STATUSES and self.statuses.get(o.id) != o.status:
                 self.statuses[o.id] = o.status
@@ -154,6 +158,7 @@ class Session:
                 if o.client_order_id.startswith(prefix)]
         self.orders_today = len(ours)
         for o in ours:
+            self.log.order_state(self.clock.now(), o)
             cid = o.client_order_id
             if cid.endswith(("-x", "-c")):
                 continue
@@ -209,6 +214,7 @@ class Session:
             self.logger.exception("exit order for %s failed", t.symbol)
             return False
         self.orders_today += 1
+        self.log.order_state(self.clock.now(), order)
         t.exit_order_id, t.exit_reason = order.id, reason
         self.event("submit", t.symbol, side=t.side, qty=t.qty, order_type="market",
                    price=t.entry_price if t.carryover else "", order_id=order.id,
@@ -332,6 +338,7 @@ class Session:
             self.event("reject", sig.symbol, side=sig.side, qty=qty, client_order_id=cid, reason=str(e)[:200])
             return
         self.orders_today += 1
+        self.log.order_state(self.clock.now(), order)
         self.trades[sig.symbol] = Trade(sig.symbol, sig.side, qty, stop, tp, sig.range_pct, cid, order.id)
         self.event("submit", sig.symbol, side=sig.side, qty=qty, order_type="bracket", price=sig.price,
                    stop_price=stop, take_profit=tp, range_pct=round(sig.range_pct, 4),
@@ -347,6 +354,7 @@ class Session:
         if self.halt_path and self.halt_path.exists():
             self.halt("HALT file present")
         account = self.broker.get_account()
+        self.snapshot(now, account)
         if risk.daily_loss_breached(account.equity, self.equity_start, self.cfg["risk"]["max_daily_loss_pct"]):
             self.halt(f"daily loss limit ({risk.daily_pnl_pct(account.equity, self.equity_start):.2f}%)")
         if self.orders_today >= risk.MAX_ORDERS_PER_DAY:
@@ -359,6 +367,18 @@ class Session:
                 self.enter_signals(now, account)
         elif not self.active():
             self.done = True
+
+    def snapshot(self, now, account, final=False):
+        """Equity and positions into the database every SNAPSHOT_SECONDS, and once more at the end."""
+        if self.mode == "replay":
+            return
+        if not final and self.last_snapshot and now - self.last_snapshot < timedelta(seconds=SNAPSHOT_SECONDS):
+            return
+        self.last_snapshot = now
+        try:
+            self.log.snapshot(now, account.equity, self.broker.list_positions())
+        except Exception:
+            self.logger.warning("equity snapshot failed", exc_info=True)
 
     def run(self):
         self.logger.info("%s session %s: strategy %s v%s, config v%s, entries until %s, exit at %s",
@@ -411,7 +431,9 @@ class Session:
         rows = self.log.trades(self.day)
         pnl = [float(r["pnl_usd"]) for r in rows]
         try:
-            equity_end = round(self.broker.get_account().equity, 2)
+            account = self.broker.get_account()
+            equity_end = round(account.equity, 2)
+            self.snapshot(self.clock.now(), account, final=True)
         except Exception:
             self.logger.exception("could not read equity for summary")
             equity_end = ""
@@ -474,6 +496,7 @@ def run_live(args):
     cfg = load_config()
     logger = setup_logging(LIVE_DATA)
     with InstanceLock(LIVE_DATA / "trader.lock"):
+        db.note_versions(STATE_DIR, "session")  # what this session trades with, if it changed
         broker = make_broker(cfg["data_feed"])
         broker.get_account()
         clock = RealClock()

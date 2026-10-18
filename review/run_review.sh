@@ -60,6 +60,7 @@ echo "=== claude exited with $?"
 
 if python review/guard.py check --snapshot "$snapshot"; then
   python review/guard.py archive
+  python db.py versions --reason review || echo "recording versions in data/trader.db failed"
   echo "=== guard passed; changes kept"
 else
   python review/guard.py revert --snapshot "$snapshot"

@@ -4,7 +4,7 @@
 #
 #   fetch -> CI passed? -> exclusive deploy lock -> fast-forward -> pip install if requirements changed
 #   -> checks (incl. database migrations) -> reinstall cron; on any failed check, roll back to the
-#   previous commit
+#   previous commit. Either way the deploy is recorded in the runs table of data/trader.db.
 #
 # It never touches data/ beyond what the checks themselves do (config key merges, database
 # migrations), and restores the config and the database if it rolls back. It refuses to deploy over
@@ -29,6 +29,16 @@ checks() {
 
 # Consistent copy of a SQLite database through its backup API (works with the WAL file present).
 sqlite_copy() { "$PY" -c 'import sqlite3, sys; s, d = sqlite3.connect(sys.argv[1]), sqlite3.connect(sys.argv[2]); s.backup(d)' "$1" "$2"; }
+
+# The deploy as a runs row (job = deploy), and what it changed in the state as versions rows. Uses
+# whichever db.py is checked out; never fails the deploy.
+record_deploy() {  # exit code, file with the output
+  local id
+  id=$("$PY" db.py run-start deploy --started "$STARTED" --sha "$(short "$TARGET")" 2>/dev/null) &&
+    "$PY" db.py run-end "$id" "$1" --output "$2" >/dev/null 2>&1
+  [ "$1" = 0 ] && "$PY" db.py versions --reason deploy >/dev/null 2>&1
+  return 0
+}
 
 log() { echo "$(date '+%F %T') $*"; }
 env_value() { grep -E "^$1=" .env 2>/dev/null | tail -1 | cut -d= -f2- || true; }
@@ -99,6 +109,7 @@ main() {
   exec 9>data/deploy.lock
   flock -n -x 9 || { once "waiting for a running job to finish"; exit 0; }
 
+  STARTED=$(TZ=America/New_York date '+%FT%T%:z')
   log "deploying $(short "$head") -> $(short "$TARGET"): $(git log -1 --format=%s "$TARGET")"
   local saved reqs_changed=0
   saved=$(mktemp -d)
@@ -115,6 +126,7 @@ main() {
     echo "$TARGET" > data/deployed
     rm -f data/deploy_status data/deploy_failed
     log "deployed $(short "$TARGET")"
+    record_deploy 0 data/deploy_checks.log
     notify "deployed $(short "$TARGET"): $(git log -1 --format=%s "$TARGET")"
   else
     git reset -q --hard "$head"
@@ -129,6 +141,7 @@ main() {
     echo "$TARGET" > data/deploy_failed
     log "checks failed on $(short "$TARGET"); rolled back to $(short "$head"). Last lines of data/deploy_checks.log:"
     tail -n 15 data/deploy_checks.log
+    record_deploy 1 data/deploy_checks.log
     notify "deploy of $(short "$TARGET") failed its checks on the Pi; rolled back to $(short "$head")"
   fi
   rm -rf "$saved"

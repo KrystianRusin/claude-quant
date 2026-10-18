@@ -150,7 +150,7 @@ class SimBroker(Broker):
 
     def list_positions(self):
         self._sync()
-        return {s: Position(s, q, avg) for s, (q, avg) in self.positions.items()}
+        return {s: Position(s, q, avg, self.marks.get(s)) for s, (q, avg) in self.positions.items()}
 
     # orders
 

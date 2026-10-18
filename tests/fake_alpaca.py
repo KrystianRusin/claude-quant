@@ -100,7 +100,8 @@ class FakeTrading:
                                shorting_enabled=True, trading_blocked=False, account_blocked=False)
 
     def get_all_positions(self):
-        return [SimpleNamespace(symbol=s, qty=str(q), avg_entry_price=str(avg)) for s, (q, avg) in self.positions.items()]
+        return [SimpleNamespace(symbol=s, qty=str(q), avg_entry_price=str(avg), current_price=str(avg))
+                for s, (q, avg) in self.positions.items()]
 
     # test control
 

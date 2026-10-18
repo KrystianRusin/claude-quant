@@ -1,4 +1,5 @@
-"""CSV trade/order/summary logs (mirrored into trader.db, see db.py) and the error log, under one data directory."""
+"""CSV trade/order/summary logs (mirrored into trader.db, see db.py), the database-only order states and
+snapshots, and the error log, under one data directory."""
 import csv
 import logging
 import math
@@ -21,6 +22,31 @@ EXIT_REASONS = ("tp", "sl", "time", "halt", "carryover")
 
 def _fmt_time(ts):
     return ts.isoformat(timespec="seconds") if ts is not None else ""
+
+
+def order_state_row(order, parent_id=None):
+    """An Order as an orders-table record (see db.put_order)."""
+    return {"order_id": order.id, "client_order_id": order.client_order_id, "parent_order_id": parent_id,
+            "symbol": order.symbol, "side": order.side, "qty": order.qty, "order_type": order.order_type,
+            "status": order.status, "filled_qty": order.filled_qty, "filled_avg_price": order.filled_avg_price,
+            "limit_price": order.limit_price, "stop_price": order.stop_price,
+            "created_at": _fmt_time(order.created_at) or None, "filled_at": _fmt_time(order.filled_at) or None}
+
+
+def snapshot_rows(now, equity, positions):
+    """(equity_snapshots record, position_snapshots records) for an equity and {symbol: Position}."""
+    rows, long_value, short_value = [], 0.0, 0.0
+    for p in sorted(positions.values(), key=lambda p: p.symbol):
+        price = p.current_price
+        value = p.qty * (price if price is not None else p.avg_entry_price)
+        long_value += max(value, 0)
+        short_value += min(value, 0)
+        rows.append({"symbol": p.symbol, "qty": p.qty, "avg_entry_price": p.avg_entry_price, "price": price,
+                     "market_value": round(value, 2),
+                     "unrealized_pnl": round((price - p.avg_entry_price) * p.qty, 2) if price is not None else None})
+    equity_row = {"ts": _fmt_time(now), "equity": round(equity, 2), "cash": round(equity - long_value - short_value, 2),
+                  "long_value": round(long_value, 2), "short_value": round(short_value, 2), "positions": len(rows)}
+    return equity_row, rows
 
 
 def trade_row(*, day, symbol, side, qty, entry_time, entry_price, exit_time, exit_price,
@@ -52,6 +78,7 @@ class TradeLog:
         self.orders_path = self.dir / "orders.csv"
         self.summary_path = self.dir / "daily_summary.csv"
         self.db = db.Mirror(self.dir / db.DB_NAME, db.BOOKS.get(mode, mode))
+        self._order_states = {}  # order id -> last record written, so unchanged orders are not rewritten
 
     def _append(self, path, fields, row):
         new = not path.exists() or path.stat().st_size == 0
@@ -72,6 +99,18 @@ class TradeLog:
                "event": event, "symbol": symbol, **fields}
         self._append(self.orders_path, ORDER_FIELDS, row)
         self.db.order_event({k: row.get(k, "") for k in ORDER_FIELDS})
+
+    def order_state(self, now, order):
+        """Record the current state of an order and its legs in the database (orders table) if it changed."""
+        for o, parent in ((order, None), *((leg, order.id) for leg in order.legs)):
+            row = order_state_row(o, parent)
+            if self._order_states.get(o.id) != row:
+                self._order_states[o.id] = row
+                self.db.order(row | {"updated_at": _fmt_time(now)})
+
+    def snapshot(self, now, equity, positions):
+        """Record the account equity and positions at `now` in the database."""
+        self.db.snapshot(*snapshot_rows(now, equity, positions))
 
     def order_rows(self, day):
         return [r for r in self._read(self.orders_path) if r["date"] == day.isoformat()]

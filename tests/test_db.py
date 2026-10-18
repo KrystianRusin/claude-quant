@@ -1,29 +1,39 @@
 """trader.db: migrations, the shared core schema, the CSV mirror, import, check, backup and restore."""
 import hashlib
 import json
+import os
 import re
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
 import db
+import logger
 from helpers import OPEN
 from logger import TradeLog
+from broker import FILLED, NEW, Order, Position
 from test_logger import row
 
-# The core schema is byte-identical in claude-sentiment-trading. Change both copies together, then
-# update this hash in both repos.
-CORE_SHA256 = "07ee2f1a050a5fca03d6c8bcd7ba56ced6fbb9f56addf6e799e4519142593581"
+# The core migrations are byte-identical in claude-sentiment-trading. Change both copies together,
+# then update these hashes in both repos.
+CORE_SHA256 = {
+    "001_core.sql": "07ee2f1a050a5fca03d6c8bcd7ba56ced6fbb9f56addf6e799e4519142593581",
+    "002_dashboard.sql": "859a3602ba3a4e4e6274d22450b791222cf56011b824198473bdcb2f59299b05",
+}
 
 
 def test_core_schema_is_the_shared_one():
-    assert hashlib.sha256((db.MIGRATIONS / "001_core.sql").read_bytes()).hexdigest() == CORE_SHA256
+    core = {f.name for n, f in db.migrations() if n < 100}
+    assert core == set(CORE_SHA256)
+    for name, sha in CORE_SHA256.items():
+        assert hashlib.sha256((db.MIGRATIONS / name).read_bytes()).hexdigest() == sha, name
 
 
 def test_migration_numbers_are_unique_and_quant_owns_200_up():
     numbers = [n for n, _ in db.migrations()]
     assert len(numbers) == len(set(numbers)) and numbers[0] == 1
-    assert all(n == 1 or n >= 200 for n in numbers)  # 2-99 core, 100-199 sentiment, 200+ quant
+    assert all(n < 100 or n >= 200 for n in numbers)  # 1-99 core, 100-199 sentiment, 200+ quant
 
 
 def test_migrations_are_additive():
@@ -39,7 +49,8 @@ def test_migrate_creates_schema_once(tmp_path):
     assert db.migrate(conn) == []
     assert db.schema_version(conn) == db.migrations()[-1][0]
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
-    assert {"meta", "order_events", "trades", "daily_summary"} <= tables
+    assert {"meta", "order_events", "trades", "daily_summary", "orders", "equity_snapshots", "position_snapshots",
+            "runs", "versions"} <= tables
     assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
 
 
@@ -183,3 +194,141 @@ def test_first_mirrored_write_imports_the_csv_history(tmp_path):
     log.order_event(OPEN + timedelta(hours=1), "fill", "SPY", order_id="abc")
     log.trade(row(entry_time=OPEN + timedelta(minutes=90)))
     assert db.compare(db.connect(tmp_path / db.DB_NAME), "paper", *db.csv_rows(tmp_path)) == []
+
+
+def order(status=NEW, **kw):
+    stop = Order("o-stop", "pt-1-s", "SPY", "sell", 5, "stop", "held", stop_price=99.5)
+    return Order(**({"id": "o-1", "client_order_id": "pt-1", "symbol": "SPY", "side": "buy", "qty": 5,
+                     "order_type": "market", "status": status, "created_at": OPEN, "legs": (stop,)} | kw))
+
+
+def test_order_states_are_upserted_only_when_they_change(tmp_path, monkeypatch):
+    log = TradeLog(tmp_path, "live")
+    writes = []
+    real = log.db.order
+    monkeypatch.setattr(log.db, "order", lambda r: (writes.append(r), real(r)))
+    log.order_state(OPEN, order())
+    log.order_state(OPEN + timedelta(seconds=30), order())  # unchanged: not written
+    log.order_state(OPEN + timedelta(minutes=1), order(FILLED, filled_qty=5, filled_avg_price=100.5,
+                                                        filled_at=OPEN + timedelta(minutes=1)))
+    assert len(writes) == 3  # entry, leg, entry again
+    conn = db.connect(tmp_path / db.DB_NAME)
+    rows = {r["order_id"]: r for r in conn.execute("SELECT * FROM orders")}
+    assert (rows["o-1"]["status"], rows["o-1"]["filled_avg_price"], rows["o-1"]["book"]) == ("filled", 100.5, "paper")
+    assert rows["o-1"]["updated_at"] == (OPEN + timedelta(minutes=1)).isoformat()
+    assert rows["o-1"]["created_at"] == OPEN.isoformat()
+    assert (rows["o-stop"]["parent_order_id"], rows["o-stop"]["stop_price"]) == ("o-1", 99.5)
+    log.order_state(OPEN, Order("o-stop", "pt-1-s", "SPY", "sell", 5, "stop", "canceled"))  # fetched alone
+    stop = conn.execute("SELECT * FROM orders WHERE order_id = 'o-stop'").fetchone()
+    assert (stop["status"], stop["parent_order_id"], stop["stop_price"]) == ("canceled", "o-1", 99.5)
+    assert db.open_order_ids(conn, "paper") == []
+
+
+def test_snapshot_rows():
+    positions = {"SPY": Position("SPY", 10, 100.0, 101.0), "QQQ": Position("QQQ", -5, 200.0, 190.0),
+                 "IWM": Position("IWM", 2, 50.0)}
+    equity, rows = logger.snapshot_rows(OPEN, 100_000, positions)
+    assert equity == {"ts": OPEN.isoformat(), "equity": 100_000, "cash": 100_000 - 1010 - 100 + 950,
+                      "long_value": 1110, "short_value": -950, "positions": 3}
+    by = {r["symbol"]: r for r in rows}
+    assert by["QQQ"]["unrealized_pnl"] == 50 and by["SPY"]["unrealized_pnl"] == 10
+    assert by["IWM"]["price"] is None and by["IWM"]["unrealized_pnl"] is None and by["IWM"]["market_value"] == 100
+
+
+def test_import_keeps_database_only_rows_and_clear_removes_them(tmp_path):
+    log = TradeLog(tmp_path, "live")
+    fill_log(log)
+    log.order_state(OPEN, order())
+    log.snapshot(OPEN, 100_000, {"SPY": Position("SPY", 5, 100.0, 100.5)})
+    conn = db.connect(tmp_path / db.DB_NAME)
+    db.resync(conn, "paper", *db.csv_rows(tmp_path))
+    counts = lambda: [conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]  # noqa: E731
+                      for t in ("orders", "equity_snapshots", "position_snapshots")]
+    assert counts() == [2, 1, 1]
+    log.clear()
+    assert counts() == [0, 0, 0]
+
+
+def test_database_only_write_to_a_new_database_imports_history_and_keeps_the_write(tmp_path):
+    log = TradeLog(tmp_path, "live")
+    fill_log(log)
+    for suffix in ("", "-wal", "-shm"):
+        (tmp_path / (db.DB_NAME + suffix)).unlink(missing_ok=True)
+    log.snapshot(OPEN, 100_000, {})
+    conn = db.connect(tmp_path / db.DB_NAME)
+    assert db.compare(conn, "paper", *db.csv_rows(tmp_path)) == []
+    assert conn.execute("SELECT equity FROM equity_snapshots").fetchone()[0] == 100_000
+
+
+def test_runs_start_end_and_lost(tmp_path):
+    import subprocess
+
+    conn = db.connect(tmp_path / db.DB_NAME)
+    gone = subprocess.Popen(["true"])
+    gone.wait()
+    stale = db.run_start(conn, "trader", "2026-09-15T09:00:00-04:00", pid=gone.pid)
+    quiet = db.run_start(conn, "manual", "2026-09-15T09:00:00-04:00")  # no pid: never marked lost
+    ok = db.run_start(conn, "backup", "2026-09-16T03:00:00-04:00", "abc1234", "3", pid=os.getpid())
+    db.run_end(conn, ok, 0, "2026-09-16T03:00:05-04:00", "all good")
+    failed = db.run_start(conn, "review", "2026-09-16T17:00:00-04:00", pid=os.getpid())
+    db.run_end(conn, failed, 2, "2026-09-16T17:01:00-04:00", "x" * 5000 + "Traceback: boom\n")
+    runs = {r["id"]: r for r in conn.execute("SELECT * FROM runs")}
+    assert runs[stale]["status"] == "lost" and runs[quiet]["status"] == "running"
+    assert (runs[ok]["status"], runs[ok]["exit_code"], runs[ok]["error"], runs[ok]["git_sha"],
+            runs[ok]["config_version"]) == ("ok", 0, None, "abc1234", "3")
+    assert runs[failed]["status"] == "failed" and runs[failed]["error"].endswith("Traceback: boom")
+    assert len(runs[failed]["error"]) <= db.ERROR_CHARS
+
+
+def state_dir(tmp_path):
+    import shutil
+
+    d = tmp_path / "state"
+    shutil.copytree(Path(db.ROOT) / "defaults", d, ignore=shutil.ignore_patterns("__pycache__"))
+    return d
+
+
+def test_versions_record_changes_only(tmp_path):
+    d = state_dir(tmp_path)
+    conn = db.connect(d / db.DB_NAME)
+    first = db.record_versions(conn, db.current_versions(d), "deploy", "2026-09-15T08:00:00-04:00")
+    assert {(k, n) for k, n, _ in first} == {("config", ""), ("strategy", "opening_range_breakout"),
+                                            ("watchlist", ""), ("memory", ""), ("prompt", "review")}
+    assert dict(((k, n), v) for k, n, v in first)[("strategy", "opening_range_breakout")] == "1"
+    assert db.record_versions(conn, db.current_versions(d), "session", "2026-09-15T09:00:00-04:00") == []
+    cfg = json.loads((d / "config.json").read_text())
+    (d / "config.shadow.json").write_text(json.dumps(cfg | {"version": cfg["version"] + 1}))
+    (d / "memory.md").write_text("# Memory\n\nchanged\n")
+    added = db.record_versions(conn, db.current_versions(d), "review", "2026-09-16T17:30:00-04:00")
+    assert sorted(added) == [("config", "shadow", str(cfg["version"] + 1)), ("memory", "", added[1][2])]
+    (d / "config.shadow.json").unlink()
+    assert db.record_versions(conn, db.current_versions(d), "review", "2026-09-17T17:30:00-04:00") == [
+        ("config", "shadow", None)]
+    removed = conn.execute("SELECT * FROM versions ORDER BY id DESC").fetchone()
+    assert (removed["sha256"], removed["content"], removed["version"]) == ("", None, None)
+    memory = conn.execute("SELECT * FROM versions WHERE kind = 'memory' ORDER BY id DESC").fetchone()
+    assert memory["content"].endswith("changed\n") and memory["version"] == memory["sha256"][:12]
+    assert memory["reason"] == "review" and memory["effective_from"] == "2026-09-16T17:30:00-04:00"
+
+
+def test_cli_runs_and_versions(tmp_path, monkeypatch, capsys):
+    import config
+
+    d = state_dir(tmp_path)
+    monkeypatch.setattr(config, "STATE_DIR", d)
+    assert db.main(["run-start", "trader", "--pid", str(os.getpid()), "--sha", "abc1234"]) == 0
+    run_id = int(capsys.readouterr().out)
+    (tmp_path / "out.log").write_text("starting\nTraceback: it broke\n")
+    assert db.main(["run-end", str(run_id), "1", "--output", str(tmp_path / "out.log")]) == 0
+    assert db.main(["versions", "--reason", "deploy"]) == 0
+    assert "recorded strategy opening_range_breakout 1" in capsys.readouterr().out
+    conn = db.connect(d / db.DB_NAME)
+    run = conn.execute("SELECT * FROM runs").fetchone()
+    assert (run["job"], run["status"], run["exit_code"], run["git_sha"]) == ("trader", "failed", 1, "abc1234")
+    assert run["error"].endswith("it broke") and run["config_version"] == "1" and run["ended_at"]
+
+
+def test_note_versions_never_raises(tmp_path, caplog):
+    (tmp_path / "blocker").write_text("not a directory")
+    assert db.note_versions(tmp_path / "blocker", "session") == []
+    assert "recording versions" in caplog.text

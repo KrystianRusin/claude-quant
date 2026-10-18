@@ -9,8 +9,8 @@ Run from the repo root:
 No network or credentials are needed. Bars are synthetic (`helpers.py`), and `test_trader.py`
 drives full sessions through `simbroker.SimBroker` with a simulated clock.
 
-`test_db.py` covers `trader.db`: migrations, the pinned shared core schema, the CSV mirror, import,
-check, backup and restore.
+`test_db.py` covers `trader.db`: migrations, the pinned shared core schemas, the CSV mirror, import,
+check, backup and restore, plus order states, snapshots, runs and versions.
 
 `test_broker_contract.py` is the contract every execution backend must pass (SimBroker, and Alpaca
 on the in-memory client in `fake_alpaca.py`). A new backend adds a harness there.

@@ -9,22 +9,41 @@ is mirrored here; a database error is logged and never stops trading. `check` co
     python db.py backup [DEST]      consistent copy of the paper database (SQLite backup API); without
                                     DEST, to data/backups/trader-<time>.db, keeping the newest 30
     python db.py restore SRC        replace the paper database with a backup
+    python db.py run-start JOB [--started TS] [--sha SHA] [--pid PID]
+                                    record a job as running; prints the run id (scripts/job.sh)
+    python db.py run-end ID CODE [--output FILE]
+                                    record how it ended; a failure keeps the end of FILE as the error
+    python db.py versions [--reason WHY]
+                                    record the config, strategies, watchlist, memory and review prompt
+                                    if they changed
 
 Each data directory has its own trader.db next to its CSVs: data/ is the paper book, and
-data/dry_run/ and data/replay/ hold the simulated books.
+data/dry_run/ and data/replay/ hold the simulated books (the shadow dry run uses data/shadow/).
+Orders and snapshots (ticket 005b) have no CSV copy; runs and versions are kept in the paper
+database only.
 """
 import argparse
 import csv
+import hashlib
 import json
 import logging
+import os
 import re
 import sqlite3
+import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parent
 MIGRATIONS = ROOT / "migrations"
 DB_NAME = "trader.db"
+ET = ZoneInfo("America/New_York")
+CSV_TABLES = ("order_events", "trades", "daily_summary")  # mirrored from the CSV files
+BOOK_TABLES = CSV_TABLES + ("orders", "equity_snapshots", "position_snapshots")
+ERROR_CHARS = 4000  # of a failed job's output kept in runs.error
+REVIEW_PROMPT = ROOT / "review" / "REVIEW_PROMPT.md"
 BOOKS = {"live": "paper", "dry-run": "dry_run", "replay": "replay"}  # TradeLog mode -> book
 RENAMES = {"timestamp": "ts"}  # CSV column -> table column
 DROPPED = {"mode"}  # CSV columns the book column replaces
@@ -148,15 +167,39 @@ def put_summary(conn, book, record):
     _insert(conn, "daily_summary", to_row(conn, "daily_summary", record, book), "INSERT OR REPLACE")
 
 
-def clear_book(conn, book):
-    for table in ("order_events", "trades", "daily_summary"):
+def put_order(conn, book, record):
+    """Insert or update one order's current state; a field missing from `record` keeps its stored value."""
+    row = to_row(conn, "orders", record, book)
+    row.pop("extra", None)
+    keys = list(row)
+    updates = ", ".join(f"{k} = COALESCE(excluded.{k}, orders.{k})" for k in keys if k not in ("book", "order_id"))
+    conn.execute(f"INSERT INTO orders ({', '.join(keys)}) VALUES ({', '.join('?' * len(keys))}) "
+                 f"ON CONFLICT (book, order_id) DO UPDATE SET {updates}", [row[k] for k in keys])
+
+
+def put_snapshot(conn, book, equity, positions):
+    """One equity_snapshots row and its position_snapshots rows, all at equity['ts']."""
+    _insert(conn, "equity_snapshots", to_row(conn, "equity_snapshots", equity, book), "INSERT OR REPLACE")
+    for p in positions:
+        _insert(conn, "position_snapshots", to_row(conn, "position_snapshots", p | {"ts": equity["ts"]}, book),
+                "INSERT OR REPLACE")
+
+
+def open_order_ids(conn, book):
+    return [r[0] for r in conn.execute(
+        "SELECT order_id FROM orders WHERE book = ? AND status IN ('new', 'held', 'partially_filled', 'pending_cancel')",
+        (book,))]
+
+
+def clear_book(conn, book, tables=BOOK_TABLES):
+    for table in tables:
         conn.execute(f"DELETE FROM {table} WHERE book = ?", (book,))
 
 
 def resync(conn, book, trades, orders, summaries):
-    """Replace a book's rows with the given CSV rows, in one transaction."""
+    """Replace a book's CSV-mirrored rows with the given CSV rows, in one transaction."""
     with conn:
-        clear_book(conn, book)
+        clear_book(conn, book, CSV_TABLES)
         for r in orders:
             add_order_event(conn, book, r)
         for r in trades:
@@ -189,33 +232,43 @@ def compare(conn, book, trades, orders, summaries):
     return problems
 
 
+def open_db(path, sources):
+    """(connection, new): the database at `path`, migrated. One that did not exist yet first imports
+    the CSV history of every book in `sources` ([(book, directory)])."""
+    new = not Path(path).exists()
+    conn = connect(path)
+    if new:
+        for book, directory in sources:
+            resync(conn, book, *csv_rows(directory))
+    return conn, new
+
+
 class Mirror:
-    """Mirrors one book's CSV writes into a database. The write that creates the database imports the
-    CSV history of every book in `sources` ([(book, directory)], default: this book, next to the
-    database) instead. Errors are logged once per process and never raised."""
+    """Mirrors one book's CSV writes into a database, and writes the facts that only it holds (orders,
+    snapshots). The write that creates the database imports the CSV history of every book in `sources`
+    ([(book, directory)], default: this book, next to the database) first. Errors are logged once per
+    process and never raised."""
 
     def __init__(self, path, book, sources=None):
         self.path, self.book = Path(path), book
         self.sources = sources or [(book, self.path.parent)]
         self.warned = False
 
-    def _run(self, fn, *args):
+    def _run(self, fn, *args, in_csv=True):
         try:
-            new = not self.path.exists()
-            conn = connect(self.path)
+            conn, new = open_db(self.path, self.sources)
             try:
-                if new:  # the first write: bring in the history, which already includes this row
-                    for book, directory in self.sources:
-                        resync(conn, book, *csv_rows(directory))
-                    return
+                if new and in_csv:  # the imported history already includes this row
+                    return None
                 with conn:
-                    fn(conn, self.book, *args)
+                    return fn(conn, self.book, *args)
             finally:
                 conn.close()
         except Exception:
             if not self.warned:
                 self.warned = True
                 LOG.warning("database write to %s failed; the CSV files are unaffected", self.path, exc_info=True)
+            return None
 
     def order_event(self, record):
         self._run(add_order_event, record)
@@ -226,8 +279,146 @@ class Mirror:
     def summary(self, record):
         self._run(put_summary, record)
 
+    def order(self, record):
+        self._run(put_order, record, in_csv=False)
+
+    def snapshot(self, equity, positions):
+        self._run(put_snapshot, equity, positions, in_csv=False)
+
+    def open_order_ids(self):
+        return self._run(open_order_ids, in_csv=False) or []
+
     def clear(self):
         self._run(clear_book)
+
+
+# ---- runs and versions (not per book)
+
+def now_iso():
+    return datetime.now(ET).isoformat(timespec="seconds")
+
+
+def _alive(pid):
+    if os.name == "nt":  # os.kill would end the process there
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # it exists, owned by someone else
+    return True
+
+
+def run_start(conn, job, started_at, git_sha=None, config_version=None, pid=None):
+    """Record a running job and return its id. Running rows whose process is gone become lost."""
+    with conn:
+        for r in conn.execute("SELECT id, pid FROM runs WHERE status = 'running' AND pid IS NOT NULL").fetchall():
+            if not _alive(r["pid"]):
+                conn.execute("UPDATE runs SET status = 'lost' WHERE id = ?", (r["id"],))
+        return conn.execute("INSERT INTO runs (job, started_at, status, git_sha, config_version, pid) "
+                            "VALUES (?, ?, 'running', ?, ?, ?)",
+                            (job, started_at, git_sha, config_version, pid)).lastrowid
+
+
+def run_end(conn, run_id, exit_code, ended_at, output=""):
+    """Record how a run ended; a failure keeps the end of its output as the error."""
+    error = (output[-ERROR_CHARS:].strip() or None) if exit_code else None
+    with conn:
+        conn.execute("UPDATE runs SET ended_at = ?, exit_code = ?, status = ?, error = ? WHERE id = ?",
+                     (ended_at, exit_code, "ok" if exit_code == 0 else "failed", error, run_id))
+
+
+def git_sha():
+    try:
+        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, capture_output=True,
+                             text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() or None
+
+
+def _sha256(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def record_versions(conn, items, reason, at):
+    """Add a versions row for each (kind, name, version, content) whose content differs from its latest
+    row, and a removal row for each (kind, name) that has rows but is no longer among `items`.
+    version None means "results carry nothing": the start of the sha256 is used. Returns the rows added
+    as (kind, name, version)."""
+    latest = {(r["kind"], r["name"]): r["sha256"] for r in conn.execute(
+        "SELECT kind, name, sha256 FROM versions WHERE id IN (SELECT MAX(id) FROM versions GROUP BY kind, name)")}
+    added, current = [], set()
+
+    def add(kind, name, version, sha, content):
+        conn.execute("INSERT INTO versions (kind, name, version, sha256, effective_from, reason, content) "
+                     "VALUES (?, ?, ?, ?, ?, ?, ?)", (kind, name, version, sha, at, reason, content))
+        added.append((kind, name, version))
+
+    with conn:
+        for kind, name, version, content in items:
+            current.add((kind, name))
+            sha = _sha256(content)
+            if latest.get((kind, name)) != sha:
+                add(kind, name, sha[:12] if version is None else str(version), sha, content)
+        for (kind, name), sha in sorted(latest.items()):
+            if (kind, name) not in current and sha != "":
+                add(kind, name, None, "", None)
+    return added
+
+
+def _read_text(path):
+    return Path(path).read_text(encoding="utf-8") if Path(path).exists() else None
+
+
+def _json_version(text):
+    try:
+        return str(json.loads(text)["version"])
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+def config_version(state_dir):
+    return _json_version(_read_text(Path(state_dir) / "config.json"))
+
+
+def current_versions(state_dir):
+    """[(kind, name, version, content)] for what drives the results: the config and the shadow config
+    (version = config_version), each strategy (version = VERSION), the watchlist, the memory and the
+    review prompt."""
+    d = Path(state_dir)
+    items = []
+    for name, file in (("", "config.json"), ("shadow", "config.shadow.json")):
+        text = _read_text(d / file)
+        if text is not None:
+            items.append(("config", name, _json_version(text), text))
+    for f in sorted((d / "strategies").glob("*.py")):
+        if not f.name.startswith("_"):
+            text = f.read_text(encoding="utf-8")
+            m = re.search(r"^VERSION\s*=\s*(\d+)", text, re.MULTILINE)
+            items.append(("strategy", f.stem, m.group(1) if m else None, text))
+    for kind, name, path in (("watchlist", "", d / "watchlist.json"), ("memory", "", d / "memory.md"),
+                             ("prompt", "review", REVIEW_PROMPT)):
+        text = _read_text(path)
+        if text is not None:
+            items.append((kind, name, None, text))
+    return items
+
+
+def note_versions(state_dir, reason):
+    """record_versions for the state in `state_dir` into its paper database. Never raises; returns the
+    rows added."""
+    path = Path(state_dir) / DB_NAME
+    try:
+        conn, _ = open_db(path, [("paper", Path(state_dir))])
+        try:
+            return record_versions(conn, current_versions(state_dir), reason, now_iso())
+        finally:
+            conn.close()
+    except Exception:
+        LOG.warning("recording versions in %s failed", path, exc_info=True)
+        return []
 
 
 def _copy(src, dest):
@@ -266,7 +457,8 @@ def book_dirs():
     import config
 
     data = Path(config.STATE_DIR)
-    found = [(data, "paper"), (data / "dry_run", "dry_run"), (data / "replay", "replay")]
+    found = [(data, "paper"), (data / "dry_run", "dry_run"), (data / "shadow", "dry_run"),
+             (data / "replay", "replay")]
     return [(d, b) for d, b in found if d.is_dir()]
 
 
@@ -287,12 +479,44 @@ def rotated_backup(folder, kept=BACKUPS_KEPT):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("command", choices=["migrate", "import", "check", "backup", "restore"])
-    ap.add_argument("path", nargs="?", help="destination for backup, source for restore")
+    sub = ap.add_subparsers(dest="command", required=True)
+    for name in ("migrate", "import", "check"):
+        sub.add_parser(name)
+    for name in ("backup", "restore"):
+        sub.add_parser(name).add_argument("path", nargs="?", help="destination for backup, source for restore")
+    s = sub.add_parser("run-start")
+    s.add_argument("job")
+    s.add_argument("--started", help="ISO time it started (default now)")
+    s.add_argument("--sha", help="git commit (default the checkout's HEAD)")
+    s.add_argument("--pid", type=int, help="process to watch: a run whose process is gone becomes lost")
+    e = sub.add_parser("run-end")
+    e.add_argument("id", type=int)
+    e.add_argument("code", type=int)
+    e.add_argument("--output", help="file holding the job's output")
+    v = sub.add_parser("versions")
+    v.add_argument("--reason", default="manual")
     args = ap.parse_args(argv)
     import config
 
-    live = Path(config.STATE_DIR) / DB_NAME
+    state = Path(config.STATE_DIR)
+    live = state / DB_NAME
+    if args.command in ("run-start", "run-end", "versions"):
+        conn, _ = open_db(live, [("paper", state)])
+        try:
+            if args.command == "run-start":
+                print(run_start(conn, args.job, args.started or now_iso(), args.sha or git_sha(),
+                                config_version(state), args.pid))
+            elif args.command == "run-end":
+                output = ""
+                if args.code and args.output and Path(args.output).exists():
+                    output = Path(args.output).read_bytes()[-ERROR_CHARS:].decode("utf-8", "replace")
+                run_end(conn, args.id, args.code, now_iso(), output)
+            else:
+                for kind, name, version in record_versions(conn, current_versions(state), args.reason, now_iso()):
+                    print(f"recorded {kind}{' ' + name if name else ''} {version or '(removed)'}")
+        finally:
+            conn.close()
+        return 0
     if args.command == "backup":
         connect(live).close()
         dest = Path(args.path) if args.path else rotated_backup(Path(config.STATE_DIR) / "backups")
