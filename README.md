@@ -281,7 +281,17 @@ claude-sentiment-trading):
 | `runs` | `scripts/job.sh` for every cron job (`running`, `ok`, `failed`, or `lost` when it died without reporting back, with the end of its output as the error), and `deploy.sh` for every deploy. Paper database only |
 | `versions` | The config and shadow config, each strategy, the watchlist, `memory.md` and the review prompt, one row each time one changes: at session start, after a review the guard passed, and on deploy. `version` is what trades carry (`config_version`, `strategy_version`). Paper database only |
 
+| `bars` | The live session's 1-minute bars for the watchlist and every symbol traded, saved at the end of the session (`003_bars.sql`), so the dashboard draws charts without calling Alpaca. Paper database only |
+
 `db.py import` rebuilds only the CSV tables and leaves these alone.
+
+**Retention.** `purge` runs at 02:50 each night. It never deletes trades, order events, daily summaries, orders or versions. It deletes:
+- 1-minute bars older than 90 days, except on days a trade held the symbol;
+- daily bars older than 2 years, except from 90 days before to 30 days after a trade;
+- intraday snapshots older than 90 days, keeping the last one of each day;
+- runs older than 90 days that ended ok (failed and lost runs are kept).
+
+The rules are constants at the top of the retention section in `db.py`. Nightly backups leave the bars out; the copy a deploy makes keeps them.
 
 ```bash
 .venv/bin/python db.py check            # CSV and database agree?
@@ -289,6 +299,7 @@ claude-sentiment-trading):
 .venv/bin/python db.py backup [DEST]
 .venv/bin/python db.py restore data/backups/trader-<time>.db
 .venv/bin/python db.py versions         # record the config, strategies, watchlist and memory if they changed
+.venv/bin/python db.py purge            # apply the retention rules now
 ```
 
 The nightly review cannot change `trader.db`: the guard checks it like any other file in `data/`.

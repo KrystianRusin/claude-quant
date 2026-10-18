@@ -406,8 +406,18 @@ class Session:
             self.finalize()
         return self
 
+    def save_bars(self):
+        """The live session's minute bars for the watchlist and every symbol traded, for the dashboard's charts."""
+        if self.mode != "live":
+            return
+        symbols = sorted(set(self.cfg["watchlist"]) | {t.symbol for t in self.all_trades()})
+        try:
+            self.log.bars(self.broker.get_bars(symbols, self.open, self.clock.now()), "1Min")
+        except Exception:
+            self.logger.warning("saving the session's bars failed", exc_info=True)
+
     def finalize(self):
-        """Flatten anything still open, make sure the account is flat, write the daily summary."""
+        """Flatten anything still open, make sure the account is flat, save the bars, write the daily summary."""
         reason = "halt" if self.halted else "time"
         try:
             deadline = self.clock.now() + timedelta(seconds=EXIT_WAIT_SECONDS)
@@ -425,6 +435,7 @@ class Session:
         except Exception:
             self.logger.exception("finalize failed; check the account for open positions")
             self.notes.append("finalize error")
+        self.save_bars()
         self.write_summary()
 
     def write_summary(self):

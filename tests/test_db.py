@@ -20,6 +20,7 @@ from test_logger import row
 CORE_SHA256 = {
     "001_core.sql": "07ee2f1a050a5fca03d6c8bcd7ba56ced6fbb9f56addf6e799e4519142593581",
     "002_dashboard.sql": "859a3602ba3a4e4e6274d22450b791222cf56011b824198473bdcb2f59299b05",
+    "003_bars.sql": "4ffdf41d3b4d2f948e9b31ba6767efa7462734a1f5903806bd2c7351177d53d3",
 }
 
 
@@ -50,7 +51,7 @@ def test_migrate_creates_schema_once(tmp_path):
     assert db.schema_version(conn) == db.migrations()[-1][0]
     tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert {"meta", "order_events", "trades", "daily_summary", "orders", "equity_snapshots", "position_snapshots",
-            "runs", "versions"} <= tables
+            "runs", "versions", "bars"} <= tables
     assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
 
 
@@ -332,3 +333,72 @@ def test_note_versions_never_raises(tmp_path, caplog):
     (tmp_path / "blocker").write_text("not a directory")
     assert db.note_versions(tmp_path / "blocker", "session") == []
     assert "recording versions" in caplog.text
+
+
+def test_bar_rows_and_put_bars(tmp_path):
+    import pandas as pd
+    from datetime import date
+    from helpers import make_bars
+
+    minute = make_bars([(1, 2, 0.5, 1.5), (1.5, 2, 1, 1.8)])
+    daily = pd.DataFrame({"open": [1.0], "high": [2.0], "low": [0.5], "close": [1.5], "volume": [10.0],
+                          "vwap": [float("nan")]}, index=[date(2026, 9, 15)])
+    conn = db.connect(tmp_path / db.DB_NAME)
+    db.put_bars(conn, {"SPY": minute, "EMPTY": minute.iloc[:0]}, "1Min")
+    db.put_bars(conn, {"SPY": daily}, "1Day")
+    db.put_bars(conn, {"SPY": minute}, "1Min")  # again: replaced, not duplicated
+    rows = conn.execute("SELECT * FROM bars ORDER BY timeframe, ts").fetchall()
+    assert [(r["timeframe"], r["ts"]) for r in rows] == [
+        ("1Day", "2026-09-15"), ("1Min", OPEN.isoformat()), ("1Min", (OPEN + timedelta(minutes=1)).isoformat())]
+    assert rows[0]["vwap"] is None and rows[2]["close"] == 1.8
+
+
+def test_purge_follows_the_retention_rules(tmp_path):
+    from datetime import date
+
+    conn = db.connect(tmp_path / "p.db")
+    today = date(2026, 10, 14)
+    with conn:
+        for sym, day in (("OLD", "2026-06-01"), ("TRADED", "2026-06-01"), ("NEW", "2026-10-01")):
+            conn.execute("INSERT INTO bars (symbol, timeframe, ts) VALUES (?, '1Min', ?)", (sym, day + "T09:30:00-04:00"))
+        for sym, day in (("OLD", "2024-01-02"), ("TRADED", "2024-01-02"), ("TRADED", "2023-06-01"), ("NEW", "2026-01-02")):
+            conn.execute("INSERT INTO bars (symbol, timeframe, ts) VALUES (?, '1Day', ?)", (sym, day))
+        conn.execute("INSERT INTO trades (book, date, symbol, side, qty, entry_date, entry_time) "
+                     "VALUES ('paper', '2026-06-01', 'TRADED', 'long', 1, '2026-06-01', 'a')")
+        conn.execute("INSERT INTO trades (book, date, symbol, side, qty, entry_date, entry_time) "
+                     "VALUES ('paper', '2024-01-10', 'TRADED', 'long', 1, '2024-01-05', 'b')")
+        for ts in ("2026-06-01T10:00:00-04:00", "2026-06-01T15:59:00-04:00", "2026-10-13T10:00:00-04:00",
+                   "2026-10-13T15:59:00-04:00"):
+            conn.execute("INSERT INTO equity_snapshots (book, ts, equity) VALUES ('paper', ?, 1)", (ts,))
+            conn.execute("INSERT INTO position_snapshots (book, ts, symbol, qty) VALUES ('paper', ?, 'X', 1)", (ts,))
+        conn.execute("INSERT INTO equity_snapshots (book, ts, equity) VALUES ('dry_run', '2026-06-01T10:00:00-04:00', 1)")
+        for status, started in (("ok", "2026-06-01T03:00:00-04:00"), ("failed", "2026-06-01T03:00:00-04:00"),
+                                ("lost", "2026-06-01T03:00:00-04:00"), ("ok", "2026-10-13T03:00:00-04:00")):
+            conn.execute("INSERT INTO runs (job, started_at, status) VALUES ('j', ?, ?)", (started, status))
+    assert db.purge(conn, today) == {"1Min bars": 1, "1Day bars": 2, "equity snapshots": 1,
+                                     "position snapshots": 1, "ok runs": 1}
+    bars = sorted((r[0], r[1], r[2][:10]) for r in conn.execute("SELECT symbol, timeframe, ts FROM bars"))
+    assert bars == [("NEW", "1Day", "2026-01-02"), ("NEW", "1Min", "2026-10-01"),
+                    ("TRADED", "1Day", "2024-01-02"), ("TRADED", "1Min", "2026-06-01")]
+    kept = [r[0] for r in conn.execute("SELECT ts FROM equity_snapshots WHERE book = 'paper' ORDER BY ts")]
+    assert kept == ["2026-06-01T15:59:00-04:00", "2026-10-13T10:00:00-04:00", "2026-10-13T15:59:00-04:00"]
+    assert [r[0] for r in conn.execute("SELECT ts FROM position_snapshots ORDER BY ts")] == kept
+    assert conn.execute("SELECT COUNT(*) FROM equity_snapshots WHERE book = 'dry_run'").fetchone()[0] == 1
+    assert sorted(r[0] for r in conn.execute("SELECT status FROM runs")) == ["failed", "lost", "ok"]
+    assert db.purge(conn, today) == dict.fromkeys(["1Min bars", "1Day bars", "equity snapshots",
+                                                   "position snapshots", "ok runs"], 0)
+
+
+def test_strip_bars_empties_only_the_bars(tmp_path):
+    conn = db.connect(tmp_path / "b.db")
+    with conn:
+        conn.executemany("INSERT INTO bars (symbol, timeframe, ts, close) VALUES ('SPY', '1Min', ?, 1)",
+                         [(str(i),) for i in range(5000)])
+        conn.execute("INSERT INTO runs (job, started_at, status) VALUES ('j', 't', 'ok')")
+    conn.close()
+    size = (tmp_path / "b.db").stat().st_size
+    db.strip_bars(tmp_path / "b.db")
+    conn = db.connect(tmp_path / "b.db")
+    assert conn.execute("SELECT COUNT(*) FROM bars").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+    assert (tmp_path / "b.db").stat().st_size < size

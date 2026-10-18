@@ -13,6 +13,7 @@ CRON_TAG="# paper-trader"
 
 lines="0 9 * * 1-5 JOB_NAME=trader $REPO/scripts/job.sh $REPO/scripts/run_trader.sh >> $REPO/data/cron.log 2>&1 $CRON_TAG
 0 17 * * 1-5 . $SECRETS; JOB_NAME=review $REPO/scripts/job.sh $REPO/review/run_review.sh $CRON_TAG
+50 2 * * * JOB_NAME=purge $REPO/scripts/job.sh $REPO/.venv/bin/python $REPO/db.py purge >> $REPO/data/cron.log 2>&1 $CRON_TAG
 0 3 * * * JOB_NAME=backup $REPO/scripts/job.sh $REPO/.venv/bin/python $REPO/db.py backup >> $REPO/data/cron.log 2>&1 $CRON_TAG
 */5 * * * * $REPO/scripts/deploy.sh >> $REPO/data/deploy.log 2>&1 $CRON_TAG"
 

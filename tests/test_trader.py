@@ -249,3 +249,23 @@ def test_replay_session_takes_no_snapshots(tmp_path, cfg):
     conn = db.connect(tmp_path / db.DB_NAME)
     assert conn.execute("SELECT COUNT(*) FROM equity_snapshots").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 3
+
+
+@pytest.mark.parametrize("mode, saved", [("live", True), ("dry-run", False)])
+def test_live_session_saves_its_minute_bars(tmp_path, cfg, mode, saved):
+    import db
+
+    clock = SimClock(OPEN - timedelta(minutes=5))
+    broker = SimBroker(FakeSource({"SPY": day_bars(TP_DAY), "QQQ": day_bars(DRIFT_DAY)}), clock, 100_000)
+    log = TradeLog(tmp_path, mode)
+    session = Session(cfg | {"watchlist": ["SPY", "QQQ"]}, broker, clock, log, LOGGER, OPEN, CLOSE, mode,
+                      poll_seconds=30, halt_path=None).run()
+    conn = db.connect(tmp_path / db.DB_NAME)
+    rows = conn.execute("SELECT * FROM bars WHERE symbol = 'SPY' ORDER BY ts").fetchall()
+    if not saved:
+        assert rows == []
+        return
+    minutes = int((session.clock.now() - OPEN).total_seconds() // 60)
+    assert {r["timeframe"] for r in rows} == {"1Min"} and abs(len(rows) - minutes) <= 1
+    assert rows[0]["ts"] == OPEN.isoformat() and (rows[15]["open"], rows[15]["high"]) == (100.5, 101.2)
+    assert conn.execute("SELECT COUNT(DISTINCT symbol) FROM bars").fetchone()[0] == 2

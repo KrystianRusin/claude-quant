@@ -112,6 +112,10 @@ class TradeLog:
         """Record the account equity and positions at `now` in the database."""
         self.db.snapshot(*snapshot_rows(now, equity, positions))
 
+    def bars(self, frames, timeframe):
+        """Record {symbol: bar frame} in the database (bars table)."""
+        self.db.bars(frames, timeframe)
+
     def order_rows(self, day):
         return [r for r in self._read(self.orders_path) if r["date"] == day.isoformat()]
 
