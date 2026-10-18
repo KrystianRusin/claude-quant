@@ -12,6 +12,7 @@ CRON_TAG="# paper-trader"
 
 lines="0 9 * * 1-5 $REPO/scripts/job.sh $REPO/scripts/run_trader.sh >> $REPO/data/cron.log 2>&1 $CRON_TAG
 0 17 * * 1-5 . $SECRETS; $REPO/scripts/job.sh $REPO/review/run_review.sh $CRON_TAG
+0 3 * * * $REPO/scripts/job.sh $REPO/.venv/bin/python $REPO/db.py backup >> $REPO/data/cron.log 2>&1 $CRON_TAG
 */5 * * * * $REPO/scripts/deploy.sh >> $REPO/data/deploy.log 2>&1 $CRON_TAG"
 
 case "${1:-}" in

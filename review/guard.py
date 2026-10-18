@@ -39,6 +39,7 @@ JOURNAL = re.compile(r"^journal/\d{4}-\d{2}-\d{2}\.md$")
 STRATEGY = re.compile(r"^strategies/[a-z][a-z0-9_]*\.py$")
 AGENT_TEST = re.compile(r"^tests/test_[a-z0-9_]+\.py$")
 SKIP_DIRS = {"__pycache__", ".pytest_cache"}
+SQLITE_TRANSIENT = ("-wal", "-shm", "-journal")  # exist only while a connection is open; trader.db itself is checked
 HISTORY_DIR = "strategy_history"
 MEMORY_ENTRY = re.compile(r"^### (M-\d+):", re.MULTILINE)
 MEMORY_STATUSES = {"hypothesis", "supported", "confirmed", "retired"}
@@ -52,6 +53,8 @@ def files(state_dir):
     for dirpath, dirnames, filenames in os.walk(state_dir):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
         for name in filenames:
+            if name.endswith(SQLITE_TRANSIENT):
+                continue
             yield (Path(dirpath) / name).relative_to(state_dir).as_posix()
 
 

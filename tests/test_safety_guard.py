@@ -53,6 +53,8 @@ def bumped(cfg, **changes):
     ("lifetime.md", False),
     ("strategy_history/orb_v1.py", False),
     ("trader.log", False),
+    ("trader.db", False),
+    ("backups/trader-20261019-030000.db", False),
 ])
 def test_path_allowlist(path, allowed):
     assert guard.path_allowed(path) is allowed
@@ -350,3 +352,9 @@ def test_archive_keeps_every_version_and_blocks_reuse(tmp_path):
     assert (state / "strategy_history" / "orb_v1.py").read_text() == "NAME = 'orb'\nVERSION = 1\n"
     module.write_text("NAME = 'orb'\nVERSION = 2\nX = 'different code, same version'\n")
     assert any("already used" in e for e in guard.strategy_version_errors(s, changed(s, state), state))
+
+
+def test_manifest_skips_sqlite_transient_files_but_not_the_database(tmp_path):
+    for name in ("trader.db", "trader.db-wal", "trader.db-shm", "memory.md"):
+        (tmp_path / name).write_text("x")
+    assert set(guard.manifest(tmp_path)) == {"trader.db", "memory.md"}

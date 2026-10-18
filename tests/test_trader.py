@@ -202,3 +202,13 @@ def test_backend_without_native_brackets_is_refused(tmp_path, cfg):
     with pytest.raises(BrokerError, match="bracket"):
         make()
     assert broker.orders == []
+
+
+def test_session_mirrors_every_write_into_the_database(tmp_path, cfg):
+    import db
+
+    _, _, _, make = setup(tmp_path, cfg, {"SPY": day_bars(TP_DAY)})
+    make().run()
+    conn = db.connect(tmp_path / db.DB_NAME)
+    assert db.compare(conn, "replay", *db.csv_rows(tmp_path)) == []
+    assert conn.execute("SELECT exit_reason FROM trades").fetchone()[0] == "tp"

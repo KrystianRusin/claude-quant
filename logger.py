@@ -1,10 +1,12 @@
-"""CSV trade/order/summary logs and the error log, all under one data directory."""
+"""CSV trade/order/summary logs (mirrored into trader.db, see db.py) and the error log, under one data directory."""
 import csv
 import logging
 import math
 from pathlib import Path
 
 import pandas as pd
+
+import db
 
 TRADE_FIELDS = ["date", "symbol", "side", "qty", "entry_time", "entry_price", "exit_time",
                 "exit_price", "exit_reason", "pnl_usd", "pnl_r", "range_pct",
@@ -49,6 +51,7 @@ class TradeLog:
         self.trades_path = self.dir / "trades.csv"
         self.orders_path = self.dir / "orders.csv"
         self.summary_path = self.dir / "daily_summary.csv"
+        self.db = db.Mirror(self.dir / db.DB_NAME, db.BOOKS.get(mode, mode))
 
     def _append(self, path, fields, row):
         new = not path.exists() or path.stat().st_size == 0
@@ -68,6 +71,7 @@ class TradeLog:
         row = {"timestamp": _fmt_time(now), "date": now.date().isoformat(), "mode": self.mode,
                "event": event, "symbol": symbol, **fields}
         self._append(self.orders_path, ORDER_FIELDS, row)
+        self.db.order_event({k: row.get(k, "") for k in ORDER_FIELDS})
 
     def order_rows(self, day):
         return [r for r in self._read(self.orders_path) if r["date"] == day.isoformat()]
@@ -78,6 +82,7 @@ class TradeLog:
         if any((r["date"], r["symbol"], r["entry_time"]) == key for r in self._read(self.trades_path)):
             return False
         self._append(self.trades_path, TRADE_FIELDS, row)
+        self.db.trade({k: row.get(k, "") for k in TRADE_FIELDS})
         return True
 
     def trades(self, day=None):
@@ -92,10 +97,12 @@ class TradeLog:
             w = csv.DictWriter(f, fieldnames=SUMMARY_FIELDS, extrasaction="ignore")
             w.writeheader()
             w.writerows(rows)
+        self.db.summary({k: row.get(k, "") for k in SUMMARY_FIELDS})
 
     def clear(self):
         for path in (self.trades_path, self.orders_path, self.summary_path):
             path.unlink(missing_ok=True)
+        self.db.clear()
 
 
 def setup_logging(data_dir, name="trader"):

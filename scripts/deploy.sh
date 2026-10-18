@@ -3,10 +3,12 @@
 # origin/main to this machine once CI has passed for it and no job is running:
 #
 #   fetch -> CI passed? -> exclusive deploy lock -> fast-forward -> pip install if requirements changed
-#   -> checks -> reinstall cron; on any failed check, roll back to the previous commit
+#   -> checks (incl. database migrations) -> reinstall cron; on any failed check, roll back to the
+#   previous commit
 #
-# It never touches data/ beyond what the checks themselves do (config key merges), and restores the
-# config if it rolls back. It refuses to deploy over local commits or local changes.
+# It never touches data/ beyond what the checks themselves do (config key merges, database
+# migrations), and restores the config and the database if it rolls back. It refuses to deploy over
+# local commits or local changes.
 #
 # Settings, from the environment or .env:
 #   NTFY_TOPIC            send deploy notifications to ntfy.sh/<topic>
@@ -16,12 +18,17 @@ set -uo pipefail
 
 NAME="claude-quant"
 CONFIG_FILES=(data/config.json data/config.shadow.json)  # may change during checks; restored on rollback
+DATABASE=data/trader.db  # migrated during checks; restored on rollback
 
 checks() {
   "$PY" -m pytest -q &&
     "$PY" config.py &&
+    "$PY" db.py migrate &&
     QUANT_STATE_DIR="$REPO/data" "$PY" -m pytest -q -p quant_testing tests/test_safety_strategies.py
 }
+
+# Consistent copy of a SQLite database through its backup API (works with the WAL file present).
+sqlite_copy() { "$PY" -c 'import sqlite3, sys; s, d = sqlite3.connect(sys.argv[1]), sqlite3.connect(sys.argv[2]); s.backup(d)' "$1" "$2"; }
 
 log() { echo "$(date '+%F %T') $*"; }
 env_value() { grep -E "^$1=" .env 2>/dev/null | tail -1 | cut -d= -f2- || true; }
@@ -96,6 +103,9 @@ main() {
   local saved reqs_changed=0
   saved=$(mktemp -d)
   for f in "${CONFIG_FILES[@]}"; do [ -f "$f" ] && mkdir -p "$saved/$(dirname "$f")" && cp -p "$f" "$saved/$f"; done
+  if [ -f "$DATABASE" ] && ! sqlite_copy "$DATABASE" "$saved/trader.db"; then
+    log "could not back up $DATABASE; not deploying"; rm -rf "$saved"; exit 1
+  fi
   git diff --quiet "$head" "$TARGET" -- requirements.txt || reqs_changed=1
   git merge -q --ff-only "$TARGET"
   [ "$reqs_changed" = 1 ] && "$PY" -m pip install -q -r requirements.txt
@@ -109,6 +119,11 @@ main() {
   else
     git reset -q --hard "$head"
     for f in "${CONFIG_FILES[@]}"; do [ -f "$saved/$f" ] && cp -p "$saved/$f" "$f"; done
+    if [ -f "$saved/trader.db" ]; then
+      sqlite_copy "$saved/trader.db" "$DATABASE" || log "WARNING: could not restore $DATABASE from the pre-deploy copy"
+    else
+      rm -f "$DATABASE" "$DATABASE-wal" "$DATABASE-shm"  # created by the failed deploy; the next one re-imports
+    fi
     [ "$reqs_changed" = 1 ] && "$PY" -m pip install -q -r requirements.txt
     scripts/cron.sh install
     echo "$TARGET" > data/deploy_failed

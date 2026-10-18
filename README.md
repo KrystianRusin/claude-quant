@@ -254,6 +254,31 @@ registry, which imports modules from `data/strategies/` as `strategies.<name>`).
 equal `INTERFACE_VERSION` in `base.py`. Raise `INTERFACE_VERSION` whenever a framework change breaks
 the contract; the registry then refuses strategies written for the old one instead of running them.
 
+## Database
+
+Trades, order events and daily summaries are also written to SQLite, `data/trader.db` (the paper
+book; `data/dry_run/` and `data/replay/` have their own). It is the source for the dashboard
+(`claude-desk`), which opens it read-only next to the sentiment trader's database.
+
+- **Dual-write phase:** the CSV files are still the source of truth and every write is mirrored
+  into the database. A database error is logged and never stops trading. The write that creates
+  the database imports the CSV history first.
+- `migrations/` holds numbered SQL files applied in order (`meta.schema_version`).
+  `001_core.sql` is the schema shared with claude-sentiment-trading, byte-identical in both repos
+  (a test pins its hash). This repo's own migrations start at 200. Migrations only ever add.
+- Deploys back up the database before updating, run `db.py migrate` in the checks, and restore
+  the copy if they roll back. A backup is written to `data/backups/` at 03:00 each night, and the
+  newest 30 are kept.
+
+```bash
+.venv/bin/python db.py check            # CSV and database agree?
+.venv/bin/python db.py import           # rebuild the database rows from the CSVs
+.venv/bin/python db.py backup [DEST]
+.venv/bin/python db.py restore data/backups/trader-<time>.db
+```
+
+The nightly review cannot change `trader.db`: the guard checks it like any other file in `data/`.
+
 ## Swapping the broker
 
 `broker.py` defines the broker-neutral interface and nothing Alpaca-specific. A backend fills one
