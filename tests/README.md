@@ -3,7 +3,7 @@
 Run from the repo root:
 
 ```bash
-.venv/Scripts/python -m pytest -q
+.venv/bin/python -m pytest -q
 ```
 
 No network or credentials are needed. Bars are synthetic (`helpers.py`), and `test_trader.py`
