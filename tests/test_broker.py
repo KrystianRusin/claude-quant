@@ -132,3 +132,32 @@ def test_broker_module_does_not_import_alpaca():
         modules = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
         modules |= {n.module or "" for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
         assert not {m for m in modules if m.split(".")[0] in ("alpaca", "alpaca_backend")}, name
+
+
+class _AssetsByExchange:
+    """A trading client that answers one exchange at a time, as Alpaca does with an exchange filter."""
+
+    def __init__(self):
+        from types import SimpleNamespace as NS
+        self.asked = []
+        self.assets = {"NYSE": [NS(symbol="AAA", name="A", exchange="NYSE", tradable=True, shortable=True, easy_to_borrow=True)],
+                       "NASDAQ": [NS(symbol="BBB", name="B", exchange="NASDAQ", tradable=True, shortable=False,
+                                     easy_to_borrow=False),
+                                  NS(symbol="HALT", name="H", exchange="NASDAQ", tradable=False, shortable=False,
+                                     easy_to_borrow=False)]}
+
+    def get_all_assets(self, req):
+        ex = req.exchange.value
+        self.asked.append(ex)
+        return self.assets.get(ex, [])
+
+
+def test_list_equities_asks_one_exchange_at_a_time():
+    """One listing on an exchange alpaca-py does not know (TXSE, October 2026) used to break the whole list."""
+    import alpaca_backend
+
+    md = alpaca_backend.AlpacaMarketData.__new__(alpaca_backend.AlpacaMarketData)
+    md.trading = _AssetsByExchange()
+    got = md.list_equities()
+    assert {a["symbol"] for a in got} == {"AAA", "BBB"}  # not tradable is left out
+    assert "OTC" not in md.trading.asked and {"NYSE", "NASDAQ", "AMEX"} <= set(md.trading.asked)

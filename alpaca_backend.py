@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 import broker as b
 
 LOG = logging.getLogger(__name__)
+LISTED_EXCHANGES = ("NYSE", "NASDAQ", "AMEX", "ARCA", "BATS")  # stocks and ETFs; OTC is left out
 
 # Alpaca order status -> neutral status. tests/test_broker.py checks that every status alpaca-py
 # knows is listed.
@@ -153,11 +154,17 @@ class AlpacaMarketData(b.MarketData):
         return asset.shortable, asset.easy_to_borrow
 
     def list_equities(self):
-        from alpaca.trading.enums import AssetClass, AssetStatus
+        """Active US stocks and ETFs on the listed exchanges (OTC is left out).
+
+        Asked for one exchange at a time: alpaca-py rejects the whole list when it holds an exchange it does
+        not know yet (one TXSE listing broke it in October 2026)."""
+        from alpaca.trading.enums import AssetClass, AssetExchange, AssetStatus
         from alpaca.trading.requests import GetAssetsRequest
 
-        assets = self.trading.get_all_assets(GetAssetsRequest(status=AssetStatus.ACTIVE,
-                                                              asset_class=AssetClass.US_EQUITY))
+        assets = []
+        for exchange in LISTED_EXCHANGES:
+            assets += self.trading.get_all_assets(GetAssetsRequest(status=AssetStatus.ACTIVE, asset_class=AssetClass.US_EQUITY,
+                                                                   exchange=AssetExchange(exchange)))
         return [{"symbol": a.symbol, "name": a.name or "", "exchange": _value(a.exchange),
                  "shortable": bool(a.shortable), "easy_to_borrow": bool(a.easy_to_borrow)}
                 for a in assets if a.tradable]
