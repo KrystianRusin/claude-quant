@@ -402,3 +402,28 @@ def test_strip_bars_empties_only_the_bars(tmp_path):
     assert conn.execute("SELECT COUNT(*) FROM bars").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
     assert (tmp_path / "b.db").stat().st_size < size
+
+
+def test_a_core_migration_added_after_a_repo_migration_is_still_applied(tmp_path, monkeypatch):
+    import shutil
+
+    folder = tmp_path / "migrations"
+    folder.mkdir()
+    for _, f in db.migrations():
+        shutil.copy(f, folder)
+    (folder / "150_own.sql").write_text("CREATE TABLE own (x);")
+    monkeypatch.setattr(db, "MIGRATIONS", folder)
+    conn = db.connect(tmp_path / "t.db")
+    assert db.schema_version(conn) == 150
+    (folder / "004_later_core.sql").write_text("CREATE TABLE later (x);")
+    assert db.migrate(conn) == [4]
+    assert db.applied_migrations(conn) == {n for n, _ in db.migrations()}
+    assert db.schema_version(conn) == 150 and db.migrate(conn) == []
+
+
+def test_databases_from_before_the_migration_list_count_every_number_up_to_their_version(tmp_path):
+    conn = db.connect(tmp_path / "t.db")
+    with conn:
+        conn.execute("DELETE FROM meta WHERE key = 'migrations'")
+    assert db.applied_migrations(conn) == set(range(1, db.schema_version(conn) + 1))
+    assert db.migrate(conn) == []

@@ -83,14 +83,31 @@ def schema_version(conn):
     return int(row[0]) if row else 0
 
 
+def applied_migrations(conn):
+    """Numbers of the migrations this database has. Databases from before the list was kept (meta key
+    'migrations') had only core migrations, so they have every number up to schema_version."""
+    try:
+        meta = dict(conn.execute("SELECT key, value FROM meta WHERE key IN ('schema_version', 'migrations')").fetchall())
+    except sqlite3.OperationalError:
+        return set()
+    if "migrations" in meta:
+        return {int(n) for n in meta["migrations"].split(",") if n}
+    return set(range(1, int(meta.get("schema_version", 0)) + 1))
+
+
 def migrate(conn):
-    """Apply the migrations newer than the database, each in one transaction. Returns their numbers."""
-    current, applied = schema_version(conn), []
+    """Apply every migration the database does not have yet, each in one transaction, in number order.
+    Returns their numbers. A core migration added after a repo's own (100+) ones is still applied, as
+    the list of applied numbers is kept, not just the highest. schema_version stays the highest."""
+    done, applied = applied_migrations(conn), []
     for number, f in migrations():
-        if number <= current:
+        if number in done:
             continue
+        done.add(number)
+        listed = ",".join(str(n) for n in sorted(done))
         conn.executescript(f"BEGIN;\n{f.read_text(encoding='utf-8')}\n"
-                           f"INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '{number}');\n"
+                           f"INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', '{max(done)}');\n"
+                           f"INSERT OR REPLACE INTO meta (key, value) VALUES ('migrations', '{listed}');\n"
                            "COMMIT;")
         applied.append(number)
     return applied
