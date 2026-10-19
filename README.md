@@ -6,7 +6,7 @@ trading strategies when its changes have to clear real evidence checks.
 
 The trading process is deterministic Python and makes no LLM calls. Claude only works after the
 close, through a headless `claude -p` run whose every change is re-checked in code and reverted if
-it breaks a rule. The design is in [SPEC.md](SPEC.md).
+it breaks a rule.
 
 Paper fills are optimistic (no slippage, queue position or market impact), and results over a short
 window say little about skill. This is not financial advice.
