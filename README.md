@@ -4,6 +4,8 @@ An automated day trader that runs on an Alpaca paper account, plus a nightly loo
 reviews the results and tunes the strategy. I built it to see how well Claude can develop and run
 trading strategies when its changes have to clear real evidence checks.
 
+Its results are live on the dashboard: https://krystianrusin.github.io/desk/
+
 The trading process is deterministic Python and makes no LLM calls. Claude only works after the
 close, through a headless `claude -p` run whose every change is re-checked in code and reverted if
 it breaks a rule.
